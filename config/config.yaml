@@ -155,6 +155,18 @@ execution:
   default_order_type: market             # market | limit
   slippage_tolerance_bps: 15             # 0.15% — reject fills beyond this from mid
 
+# --- Exit management ----------------------------------------------------------
+exit:
+  atr_period: 14
+  atr_trailing_mult: 1.5        # trailing SL = price ± (mult × ATR)
+  breakeven_trigger_r: 1.0      # move SL to entry after 1R gain
+  partial_tp_trigger_r: 1.5     # close partial_tp_fraction at 1.5R gain
+  partial_tp_fraction: 0.5      # fraction of position closed at partial TP
+  trailing_trigger_r: 2.0       # start trailing SL after 2R gain
+  max_bars_open: 48              # time-exit after 48 × 15m bars = 12h
+  time_exit_min_r: 0.5          # skip time-exit if position already at >= this R
+  check_interval_sec: 30.0      # how often the polling loop wakes up
+
 # --- Paper trading simulator --------------------------------------------------
 paper:
   starting_balance_usd: 10000.0
