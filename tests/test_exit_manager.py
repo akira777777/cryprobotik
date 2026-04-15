@@ -28,7 +28,8 @@ from src.exchanges.base import (
     OrderStatus,
     PositionSide,
 )
-from src.execution.exit_manager import ExitConfig, ExitManager, _ExitState
+from src.execution.exit_manager import ExitManager, _ExitState
+from src.settings import ExitConfig
 
 
 # ─────────────────────── helpers ───────────────────────
@@ -343,13 +344,15 @@ async def test_time_exit_fires_when_bars_exceeded_and_low_r() -> None:
         risk_usd=5.0,
     )
 
-    # Run enough checks to exceed max_bars_open
+    # Advance bar counter beyond max_bars_open via on_bar_close, then check
+    for _ in range(5):  # 5 > max_bars_open=3
+        manager.on_bar_close(EXCHANGE, SYMBOL, "15m")
+
     with patch("src.monitoring.prom_metrics.exits_breakeven_total") as be, \
          patch("src.monitoring.prom_metrics.exits_time_stop_total") as ts:
         be.labels.return_value = MagicMock()
         ts.labels.return_value = MagicMock()
-        for _ in range(5):  # 5 > max_bars_open=3
-            await manager._check_all_positions()
+        await manager._check_all_positions()
 
     # A reduce-only MARKET order should have been placed for full quantity
     market_orders = [
@@ -432,6 +435,7 @@ async def test_adjust_stop_places_new_before_cancelling_old() -> None:
         tracker=MagicMock(),
         feature_store=FeatureStore(),
         connectors={EXCHANGE: conn},
+        config=ExitConfig(),
     )
     success = await manager.adjust_stop(conn, pos, new_sl=97.0, state=state)
 
@@ -454,6 +458,7 @@ async def test_adjust_stop_does_not_cancel_if_new_order_fails() -> None:
         tracker=MagicMock(),
         feature_store=FeatureStore(),
         connectors={EXCHANGE: conn},
+        config=ExitConfig(),
     )
     success = await manager.adjust_stop(conn, pos, new_sl=97.0, state=state)
 
@@ -461,3 +466,71 @@ async def test_adjust_stop_does_not_cancel_if_new_order_fails() -> None:
     conn.cancel_order.assert_not_called()
     # current_sl must remain unchanged
     assert state.current_sl == pytest.approx(95.0)
+
+
+# ─────────────────────── on_bar_close ───────────────────────
+
+
+async def test_bars_open_counts_15m_only() -> None:
+    """on_bar_close increments bars_open only for 15m timeframe."""
+    conn = _make_connector()
+    pos = _make_position()
+
+    manager = _make_exit_manager([pos], {EXCHANGE: conn})
+    manager.register_position(
+        EXCHANGE, SYMBOL,
+        entry_ts=datetime(2026, 1, 1, tzinfo=UTC),
+        original_sl=95.0,
+        risk_usd=5.0,
+    )
+
+    # 1h bar — should NOT increment
+    manager.on_bar_close(EXCHANGE, SYMBOL, "1h")
+    assert manager._states[(EXCHANGE, SYMBOL)].bars_open == 0
+
+    # 15m bar — should increment
+    manager.on_bar_close(EXCHANGE, SYMBOL, "15m")
+    assert manager._states[(EXCHANGE, SYMBOL)].bars_open == 1
+
+    # 4h bar — should NOT increment
+    manager.on_bar_close(EXCHANGE, SYMBOL, "4h")
+    assert manager._states[(EXCHANGE, SYMBOL)].bars_open == 1
+
+
+async def test_time_exit_fires_at_correct_bar_count() -> None:
+    """Time exit fires exactly when bars_open reaches max_bars_open via on_bar_close."""
+    conn = _make_connector()
+    # Position barely moved — 0.2R gain, below time_exit_min_r=0.5
+    pos = _make_position(entry_price=100.0, mark_price=101.0)
+
+    manager = _make_exit_manager([pos], {EXCHANGE: conn}, config=ExitConfig(
+        max_bars_open=3,
+        time_exit_min_r=0.5,
+        breakeven_trigger_r=1.0,
+        partial_tp_trigger_r=1.5,
+        trailing_trigger_r=2.0,
+    ))
+    manager.register_position(
+        EXCHANGE, SYMBOL,
+        entry_ts=datetime(2026, 1, 1, tzinfo=UTC),
+        original_sl=95.0,
+        risk_usd=5.0,
+    )
+
+    # Advance bar counter to exactly max_bars_open via on_bar_close
+    for _ in range(3):
+        manager.on_bar_close(EXCHANGE, SYMBOL, "15m")
+
+    assert manager._states[(EXCHANGE, SYMBOL)].bars_open == 3
+
+    with patch("src.monitoring.prom_metrics.exits_time_stop_total") as ts:
+        ts.labels.return_value = MagicMock()
+        await manager._check_all_positions()
+
+    # A reduce-only market order for time_stop should have been placed
+    time_stop_calls = [
+        c.args[0] for c in conn.place_order.call_args_list
+        if c.args[0].reduce_only and c.args[0].meta.get("exit") == "time_stop"
+    ]
+    assert time_stop_calls, "expected time-exit market order when bars_open == max_bars_open"
+    ts.labels.assert_called()
