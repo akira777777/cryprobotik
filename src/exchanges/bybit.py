@@ -161,6 +161,8 @@ class BybitConnector(ExchangeConnector):
         try:
             await self._rest.close()
         except Exception:
+            # ccxt close() can raise if the aiohttp session is already gone during
+            # interpreter shutdown. Safe to ignore during connector teardown.
             pass
 
     # ─────────────────────── private WS login ───────────────────────
@@ -306,9 +308,13 @@ class BybitConnector(ExchangeConnector):
                 try:
                     self._trade_q.put_nowait(evt)
                 except asyncio.QueueFull:
-                    pass
-            except (KeyError, ValueError):
-                pass
+                    pass  # trades are high-frequency; drop on overflow, CVD will be approximate
+            except (KeyError, ValueError) as e:
+                from src.monitoring import prom_metrics as m
+                m.ws_parse_errors_total.labels(
+                    exchange=self.name, channel="trades", reason="parse_error"
+                ).inc()
+                log.debug("bybit.trade_parse_error", row=row, error=str(e))
 
     async def _emit_funding_from_ticker(
         self, topic: str, data: dict[str, Any] | list[dict[str, Any]]
@@ -337,8 +343,18 @@ class BybitConnector(ExchangeConnector):
                     next_funding_ts=next_ts,
                 )
                 self._funding_q.put_nowait(evt)
-            except (ValueError, asyncio.QueueFull):
-                pass
+            except asyncio.QueueFull:
+                from src.monitoring import prom_metrics as m
+                m.ws_parse_errors_total.labels(
+                    exchange=self.name, channel="tickers", reason="queue_full"
+                ).inc()
+                # Funding WS is supplementary to the REST poll; safe to drop one event.
+            except ValueError as e:
+                from src.monitoring import prom_metrics as m
+                m.ws_parse_errors_total.labels(
+                    exchange=self.name, channel="tickers", reason="parse_error"
+                ).inc()
+                log.debug("bybit.funding_parse_error", row=row, error=str(e))
 
     async def _handle_private_message(self, msg: dict[str, Any]) -> None:
         op = msg.get("op")
@@ -464,8 +480,21 @@ class BybitConnector(ExchangeConnector):
                     ts=now_utc(),
                 )
                 self._position_q.put_nowait(evt)
-            except (ValueError, asyncio.QueueFull):
-                pass
+            except asyncio.QueueFull:
+                log.error(
+                    "bybit.position_queue_full_dropping_event",
+                    symbol=row.get("symbol"),
+                )
+                from src.monitoring import prom_metrics as m
+                m.ws_parse_errors_total.labels(
+                    exchange=self.name, channel="position", reason="queue_full"
+                ).inc()
+            except ValueError as e:
+                log.warning(
+                    "bybit.position_parse_error",
+                    symbol=row.get("symbol"),
+                    error=str(e),
+                )
 
     # ─────────────────────── REST: market data ───────────────────────
 

@@ -122,6 +122,15 @@ class VWAPStrategyConfig(BaseModel):
     base_confidence: float = Field(0.60, ge=0.0, le=1.0)
 
 
+class LiquidationCascadeStrategyConfig(BaseModel):
+    enabled: bool = True
+    timeframe: str = "15m"
+    oi_roc_threshold: float = Field(-0.03, le=0.0)   # −3% OI drop required
+    atr_period: int = Field(14, ge=2)
+    atr_multiplier: float = Field(1.5, gt=0.0)
+    base_confidence: float = Field(0.60, ge=0.0, le=1.0)
+
+
 class CVDConfig(BaseModel):
     enabled: bool = True
     max_bars: int = Field(200, ge=10)
@@ -144,6 +153,9 @@ class StrategiesConfig(BaseModel):
         default_factory=FundingContrarianStrategyConfig
     )
     vwap: VWAPStrategyConfig = Field(default_factory=VWAPStrategyConfig)
+    liquidation_cascade: LiquidationCascadeStrategyConfig = Field(
+        default_factory=LiquidationCascadeStrategyConfig
+    )
     cvd: CVDConfig = Field(default_factory=CVDConfig)
     oi: OIConfig = Field(default_factory=OIConfig)
 

@@ -189,6 +189,8 @@ class OKXConnector(ExchangeConnector):
         try:
             await self._rest.close()
         except Exception:
+            # ccxt close() can raise if the aiohttp session is already gone during
+            # interpreter shutdown. Safe to ignore during connector teardown.
             pass
 
     # ─────────────────────── private-channel login ───────────────────────
@@ -369,8 +371,12 @@ class OKXConnector(ExchangeConnector):
                     self._trade_q.put_nowait(evt)
                 except asyncio.QueueFull:
                     pass  # trades are high-frequency; drop on overflow, CVD will be approximate
-            except (KeyError, ValueError):
-                pass
+            except (KeyError, ValueError) as e:
+                from src.monitoring import prom_metrics as m
+                m.ws_parse_errors_total.labels(
+                    exchange=self.name, channel="trades", reason="parse_error"
+                ).inc()
+                log.debug("okx.trade_parse_error", row=row, error=str(e))
 
     async def _emit_funding(self, data: list[dict[str, Any]]) -> None:
         for row in data:
@@ -388,8 +394,18 @@ class OKXConnector(ExchangeConnector):
                     next_funding_ts=next_ts,
                 )
                 self._funding_q.put_nowait(evt)
-            except (ValueError, asyncio.QueueFull):
-                pass
+            except asyncio.QueueFull:
+                from src.monitoring import prom_metrics as m
+                m.ws_parse_errors_total.labels(
+                    exchange=self.name, channel="funding-rate", reason="queue_full"
+                ).inc()
+                # Funding WS is supplementary to the REST poll; safe to drop one event.
+            except ValueError as e:
+                from src.monitoring import prom_metrics as m
+                m.ws_parse_errors_total.labels(
+                    exchange=self.name, channel="funding-rate", reason="parse_error"
+                ).inc()
+                log.debug("okx.funding_parse_error", row=row, error=str(e))
 
     async def _handle_private_message(self, msg: dict[str, Any]) -> None:
         event = msg.get("event")
@@ -510,8 +526,21 @@ class OKXConnector(ExchangeConnector):
                     ts=now_utc(),
                 )
                 self._position_q.put_nowait(evt)
-            except (ValueError, asyncio.QueueFull):
-                pass
+            except asyncio.QueueFull:
+                log.error(
+                    "okx.position_queue_full_dropping_event",
+                    inst_id=row.get("instId"),
+                )
+                from src.monitoring import prom_metrics as m
+                m.ws_parse_errors_total.labels(
+                    exchange=self.name, channel="positions", reason="queue_full"
+                ).inc()
+            except ValueError as e:
+                log.warning(
+                    "okx.position_parse_error",
+                    inst_id=row.get("instId"),
+                    error=str(e),
+                )
 
     # ─────────────────────── REST: market data ───────────────────────
 

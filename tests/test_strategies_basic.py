@@ -39,7 +39,9 @@ import pandas as pd
 from src.data.feature_store import Bar, FeatureKey, FeatureStore, FundingHistory
 from src.exchanges.base import OrderSide
 from src.strategies.base import SignalAction
+from src.data.feature_store import OIStore
 from src.strategies.funding_contrarian import FundingContrarianStrategy
+from src.strategies.liquidation_cascade import LiquidationCascadeStrategy
 from src.strategies.mean_reversion import MeanReversionStrategy
 from src.strategies.momentum import MomentumStrategy
 from src.strategies.vwap import VWAPStrategy
@@ -456,3 +458,181 @@ def test_vwap_returns_empty_on_insufficient_bars() -> None:
 
     strategy = VWAPStrategy(timeframe="15m", ema_period=50, base_confidence=0.60)
     assert strategy.evaluate(SYMBOL, store, EXCHANGE, _TS0) == []
+
+
+# ─────────────────────── LiquidationCascadeStrategy ───────────────────────
+
+
+def _build_lc_store_and_oi(
+    *,
+    n_flat: int = 50,
+    flat_price: float = 50_000.0,
+    bar_range: float = 50.0,       # high = flat_price + bar_range, low = flat_price - bar_range
+    cascade_drop: float = 200.0,   # last bar falls by this much → triggers if > 1.5×ATR
+    oi_start: float = 1000.0,
+    oi_end: float = 950.0,         # -5% drop (triggers at -3%)
+) -> tuple[FeatureStore, OIStore]:
+    """Return (FeatureStore, OIStore) preloaded for a long-liq cascade scenario."""
+    store = FeatureStore()
+
+    closes = [flat_price] * n_flat + [flat_price - cascade_drop]
+    n = len(closes)
+    highs = [c + bar_range for c in closes]
+    lows = [c - bar_range for c in closes]
+
+    _populate_store(store, closes, "15m", 15 * 60, highs=highs, lows=lows)
+
+    oi = OIStore()
+    oi.update(EXCHANGE, SYMBOL, oi_start)
+    oi.update(EXCHANGE, SYMBOL, oi_end)
+    return store, oi
+
+
+def test_liquidation_cascade_buy_on_liq_drop() -> None:
+    """OI drops 5% AND price falls 200 (> 1.5×ATR≈100) → BUY signal."""
+    store, oi = _build_lc_store_and_oi()
+    strategy = LiquidationCascadeStrategy(
+        oi_store=oi,
+        timeframe="15m",
+        oi_roc_threshold=-0.03,
+        atr_period=14,
+        atr_multiplier=1.5,
+        base_confidence=0.60,
+    )
+    signals = strategy.evaluate(SYMBOL, store, EXCHANGE, _TS0)
+    buys = [s for s in signals if s.side == OrderSide.BUY]
+    assert buys, f"expected BUY on liquidation cascade, got: {signals}"
+    for s in buys:
+        assert s.action == SignalAction.OPEN
+        assert 0.0 < s.confidence <= 1.0
+        assert s.strategy == "liquidation_cascade"
+
+
+def test_liquidation_cascade_sell_on_short_liq() -> None:
+    """OI drops 5% AND price rises 200 → SELL (short-squeeze liq cascade)."""
+    store = FeatureStore()
+    flat = 50_000.0
+    n_flat = 50
+    closes = [flat] * n_flat + [flat + 200.0]
+    highs = [c + 50 for c in closes]
+    lows = [c - 50 for c in closes]
+    _populate_store(store, closes, "15m", 15 * 60, highs=highs, lows=lows)
+
+    oi = OIStore()
+    oi.update(EXCHANGE, SYMBOL, 1000.0)
+    oi.update(EXCHANGE, SYMBOL, 930.0)  # -7% drop
+
+    strategy = LiquidationCascadeStrategy(
+        oi_store=oi,
+        timeframe="15m",
+        oi_roc_threshold=-0.03,
+        atr_period=14,
+        atr_multiplier=1.5,
+        base_confidence=0.60,
+    )
+    signals = strategy.evaluate(SYMBOL, store, EXCHANGE, _TS0)
+    sells = [s for s in signals if s.side == OrderSide.SELL]
+    assert sells, f"expected SELL on short-liq cascade, got: {signals}"
+
+
+def test_liquidation_cascade_no_signal_when_oi_drop_small() -> None:
+    """OI only drops 1% (below -3% threshold) → no signal even with large price move."""
+    store, _ = _build_lc_store_and_oi(oi_end=990.0)  # only -1% OI drop
+
+    oi = OIStore()
+    oi.update(EXCHANGE, SYMBOL, 1000.0)
+    oi.update(EXCHANGE, SYMBOL, 990.0)
+
+    strategy = LiquidationCascadeStrategy(
+        oi_store=oi,
+        timeframe="15m",
+        oi_roc_threshold=-0.03,
+        atr_period=14,
+        atr_multiplier=1.5,
+        base_confidence=0.60,
+    )
+    store2 = FeatureStore()
+    closes = [50_000.0] * 50 + [50_000.0 - 200.0]
+    _populate_store(store2, closes, "15m", 15 * 60)
+
+    signals = strategy.evaluate(SYMBOL, store2, EXCHANGE, _TS0)
+    assert signals == [], f"expected no signal with small OI drop, got: {signals}"
+
+
+def test_liquidation_cascade_no_signal_when_price_move_small() -> None:
+    """OI drops 5% but price barely moves → no signal."""
+    store = FeatureStore()
+    flat = 50_000.0
+    # Last bar only drops 10 (ATR≈100, 10 < 1.5×100=150 → no trigger)
+    closes = [flat] * 50 + [flat - 10.0]
+    highs = [c + 50 for c in closes]
+    lows = [c - 50 for c in closes]
+    _populate_store(store, closes, "15m", 15 * 60, highs=highs, lows=lows)
+
+    oi = OIStore()
+    oi.update(EXCHANGE, SYMBOL, 1000.0)
+    oi.update(EXCHANGE, SYMBOL, 940.0)  # -6% OI drop
+
+    strategy = LiquidationCascadeStrategy(
+        oi_store=oi,
+        timeframe="15m",
+        oi_roc_threshold=-0.03,
+        atr_period=14,
+        atr_multiplier=1.5,
+        base_confidence=0.60,
+    )
+    signals = strategy.evaluate(SYMBOL, store, EXCHANGE, _TS0)
+    assert signals == [], f"expected no signal with small price move, got: {signals}"
+
+
+def test_liquidation_cascade_no_signal_on_insufficient_bars() -> None:
+    """Fewer than atr_period + 2 bars → returns []."""
+    store = FeatureStore()
+    _populate_store(store, [50_000.0] * 10, "15m", 15 * 60)
+
+    oi = OIStore()
+    oi.update(EXCHANGE, SYMBOL, 1000.0)
+    oi.update(EXCHANGE, SYMBOL, 900.0)
+
+    strategy = LiquidationCascadeStrategy(
+        oi_store=oi,
+        timeframe="15m",
+        oi_roc_threshold=-0.03,
+        atr_period=14,
+        atr_multiplier=1.5,
+        base_confidence=0.60,
+    )
+    assert strategy.evaluate(SYMBOL, store, EXCHANGE, _TS0) == []
+
+
+def test_liquidation_cascade_confidence_scales_with_oi_drop() -> None:
+    """Larger OI drop → higher confidence (scales between base and 1.0)."""
+    base_conf = 0.60
+
+    def _run_with_oi_end(oi_end: float) -> float:
+        store = FeatureStore()
+        closes = [50_000.0] * 50 + [50_000.0 - 200.0]
+        highs = [c + 50 for c in closes]
+        lows = [c - 50 for c in closes]
+        _populate_store(store, closes, "15m", 15 * 60, highs=highs, lows=lows)
+        oi = OIStore()
+        oi.update(EXCHANGE, SYMBOL, 1000.0)
+        oi.update(EXCHANGE, SYMBOL, oi_end)
+        strategy = LiquidationCascadeStrategy(
+            oi_store=oi,
+            timeframe="15m",
+            oi_roc_threshold=-0.03,
+            atr_period=14,
+            atr_multiplier=1.5,
+            base_confidence=base_conf,
+        )
+        sigs = strategy.evaluate(SYMBOL, store, EXCHANGE, _TS0)
+        return sigs[0].confidence if sigs else 0.0
+
+    conf_small = _run_with_oi_end(970.0)   # -3% drop (at threshold)
+    conf_large = _run_with_oi_end(850.0)   # -15% drop (well above threshold)
+
+    assert conf_small >= base_conf
+    assert conf_large > conf_small, (
+        f"larger OI drop should give higher confidence: {conf_large} vs {conf_small}"
+    )

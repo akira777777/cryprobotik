@@ -55,6 +55,12 @@ ws_reconnects_total = Counter(
     ["exchange", "channel"],
     registry=REGISTRY,
 )
+ws_parse_errors_total = Counter(
+    "cryprobotik_ws_parse_errors_total",
+    "WebSocket message parse errors (dropped messages)",
+    ["exchange", "channel", "reason"],
+    registry=REGISTRY,
+)
 
 # ─────────────────────── gauges ───────────────────────
 equity_gauge = Gauge(

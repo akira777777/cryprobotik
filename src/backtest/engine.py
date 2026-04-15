@@ -308,33 +308,42 @@ class BacktestEngine:
                 continue
 
             try:
-                signals = self._ensemble.evaluate_symbol(symbol, replay_store, cfg.exchange, bar_ts)
+                result_tuple = self._ensemble.evaluate_symbol(symbol, replay_store, cfg.exchange, bar_ts)
+                signal, regime, raw_signals = result_tuple
             except Exception as e:
                 log.debug("backtest.ensemble_error", symbol=symbol, error=str(e))
                 continue
 
-            if not signals:
+            if signal is None:
                 continue
-
-            signal = signals[0]
 
             # ML filter (optional — cold-start in backtest mode passes through)
             if self._ml_filter and cfg.use_ml_filter:
                 try:
                     decision = await self._ml_filter.evaluate(
-                        signal, replay_store, cfg.exchange, bar_ts
+                        signal, replay_store, cfg.exchange
                     )
                     if not decision.accepted:
                         continue
                 except Exception:
                     pass  # pass-through on error
 
+            # Compute ATR for sizing (needed by RiskManager)
+            atr_val = _get_atr_from_store(replay_store, cfg.exchange, symbol, cfg.primary_timeframe)
+            if atr_val is None or atr_val <= 0:
+                continue  # can't size without ATR
+
             # Size the trade using the real RiskManager
             sized = risk_manager.size_trade(
-                signal=signal,
+                symbol=symbol,
                 exchange=cfg.exchange,
+                side=signal.side,
+                entry_price=evt.close,
+                atr=atr_val,
                 equity=balance,
-                feature_store=replay_store,
+                free_margin=balance,  # conservative: treat full balance as free
+                strategy=signal.strategy,
+                confidence=signal.confidence,
             )
             if isinstance(sized, RejectedTrade):
                 continue
@@ -493,6 +502,29 @@ class BacktestEngine:
 
 
 # ─────────────────────── helpers ───────────────────────
+
+
+def _get_atr_from_store(
+    store: FeatureStore,
+    exchange: str,
+    symbol: str,
+    timeframe: str,
+    period: int = 14,
+) -> float | None:
+    """Return the current ATR value from the FeatureStore."""
+    try:
+        from src.utils.indicators import atr as compute_atr  # noqa: PLC0415
+        key = FeatureKey(exchange, symbol, timeframe)
+        df = store.as_df(key, min_bars=period + 5)
+        if df is None:
+            return None
+        series = compute_atr(df, length=period)
+        if series is None or series.empty:
+            return None
+        val = float(series.iloc[-1])
+        return None if math.isnan(val) else val
+    except Exception:
+        return None
 
 
 def _apply_slippage(price: float, side: OrderSide, slippage_bps: float) -> float:

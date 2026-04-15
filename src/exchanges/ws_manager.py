@@ -95,12 +95,16 @@ class WSManager:
             try:
                 await self._ws.close()
             except Exception:
+                # Expected during teardown: the socket may already be closed or
+                # the network may be gone. Logging here would always fire on shutdown.
                 pass
         if self._run_task and not self._run_task.done():
             self._run_task.cancel()
             try:
                 await self._run_task
             except (asyncio.CancelledError, Exception):
+                # CancelledError is the normal result of cancel(); any other exception
+                # means _run_forever already exited with an error (already logged there).
                 pass
         log.info("ws.stopped", name=self._config.name)
 
@@ -126,6 +130,8 @@ class WSManager:
             try:
                 await self.send(unsub_payload)
             except Exception:
+                # Best-effort: the subscription is already removed from local state.
+                # If the WS send fails the server will drop it on the next reconnect.
                 pass
 
     async def wait_connected(self, timeout: float | None = None) -> bool:
@@ -258,6 +264,8 @@ class WSManager:
                     try:
                         await self._ws.close(code=1011, reason="stale")
                     except Exception:
+                        # Close may fail if the socket is already gone — that's exactly
+                        # why it was detected as stale. _run_forever handles reconnect.
                         pass
                     return  # triggers reconnect via _run_forever
             except asyncio.CancelledError:
@@ -273,6 +281,8 @@ class WSManager:
                     if self._ws is not None:
                         await self._ws.close(code=1011, reason="ping_failed")
                 except Exception:
+                    # Socket may already be gone if ping failed due to connection drop.
+                    # _run_forever handles reconnect regardless.
                     pass
                 return  # triggers reconnect via _run_forever
 

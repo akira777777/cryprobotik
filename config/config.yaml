@@ -26,10 +26,11 @@ exchanges:
     ws_reconnect_max_backoff_sec: 30
 
   bybit:
-    enabled: false
+    enabled: true
     # Endpoint selection is driven by `mode`:
     #   testnet → stream-testnet.bybit.com/v5/public/linear
     #   live    → stream.bybit.com/v5/public/linear
+    # Requires BYBIT_API_KEY and BYBIT_API_SECRET in .env to be set.
     rest_rate_limit_per_sec: 10
     ws_ping_interval_sec: 20
     ws_reconnect_max_backoff_sec: 30
@@ -90,6 +91,14 @@ strategies:
     vwap_band_pct: 0.001             # 0.1% band around VWAP for touch detection
     base_confidence: 0.60
 
+  liquidation_cascade:
+    enabled: true
+    timeframe: "15m"
+    oi_roc_threshold: -0.03          # −3% OI drop in one poll interval required
+    atr_period: 14
+    atr_multiplier: 1.5              # bar move must exceed 1.5×ATR
+    base_confidence: 0.60
+
   volatility_breakout:
     enabled: true
     timeframe: "1h"
@@ -109,11 +118,11 @@ regime:
   # Regime → strategy weight matrix. Signals are aggregated by weighted confidence.
   min_net_vote: 0.20                       # lowered from 0.30 — was too restrictive, blocked all chop trades
   weights:
-    trend_high_vol:   { momentum: 1.0, volatility_breakout: 1.0, mean_reversion: 0.0, funding_arb: 1.0, funding_contrarian: 0.7, vwap: 0.5 }
-    trend_low_vol:    { momentum: 0.9, volatility_breakout: 0.5, mean_reversion: 0.0, funding_arb: 1.0, funding_contrarian: 0.5, vwap: 0.7 }
-    range_high_vol:   { momentum: 0.2, volatility_breakout: 0.3, mean_reversion: 1.0, funding_arb: 1.0, funding_contrarian: 0.6, vwap: 1.0 }
-    range_low_vol:    { momentum: 0.0, volatility_breakout: 0.1, mean_reversion: 1.0, funding_arb: 1.0, funding_contrarian: 0.3, vwap: 1.0 }
-    chop:             { momentum: 0.0, volatility_breakout: 0.0, mean_reversion: 0.3, funding_arb: 1.0, funding_contrarian: 0.4, vwap: 0.5 }
+    trend_high_vol:   { momentum: 1.0, volatility_breakout: 1.0, mean_reversion: 0.0, funding_arb: 1.0, funding_contrarian: 0.7, vwap: 0.5, liquidation_cascade: 0.8 }
+    trend_low_vol:    { momentum: 0.9, volatility_breakout: 0.5, mean_reversion: 0.0, funding_arb: 1.0, funding_contrarian: 0.5, vwap: 0.7, liquidation_cascade: 0.4 }
+    range_high_vol:   { momentum: 0.2, volatility_breakout: 0.3, mean_reversion: 1.0, funding_arb: 1.0, funding_contrarian: 0.6, vwap: 1.0, liquidation_cascade: 0.7 }
+    range_low_vol:    { momentum: 0.0, volatility_breakout: 0.1, mean_reversion: 1.0, funding_arb: 1.0, funding_contrarian: 0.3, vwap: 1.0, liquidation_cascade: 0.2 }
+    chop:             { momentum: 0.0, volatility_breakout: 0.0, mean_reversion: 0.3, funding_arb: 1.0, funding_contrarian: 0.4, vwap: 0.5, liquidation_cascade: 0.0 }
 
 # --- Risk management (hard limits) --------------------------------------------
 risk:

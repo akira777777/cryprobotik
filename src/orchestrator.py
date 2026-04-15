@@ -66,6 +66,7 @@ from src.strategies.momentum import MomentumStrategy
 from src.strategies.regime import RegimeClassifier
 from src.strategies.volatility_breakout import VolatilityBreakoutStrategy
 from src.strategies.vwap import VWAPStrategy
+from src.strategies.liquidation_cascade import LiquidationCascadeStrategy
 from src.ml.model import MLSignalFilter
 from src.utils.indicators import atr
 from src.utils.logging import get_logger
@@ -469,6 +470,18 @@ class Orchestrator:
                     ema_period=cfg.vwap.ema_period,
                     vwap_band_pct=cfg.vwap.vwap_band_pct,
                     base_confidence=cfg.vwap.base_confidence,
+                )
+            )
+
+        if cfg.liquidation_cascade.enabled and self._oi_store is not None:
+            strategies.append(
+                LiquidationCascadeStrategy(
+                    oi_store=self._oi_store,
+                    timeframe=cfg.liquidation_cascade.timeframe,
+                    oi_roc_threshold=cfg.liquidation_cascade.oi_roc_threshold,
+                    atr_period=cfg.liquidation_cascade.atr_period,
+                    atr_multiplier=cfg.liquidation_cascade.atr_multiplier,
+                    base_confidence=cfg.liquidation_cascade.base_confidence,
                 )
             )
 
