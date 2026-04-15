@@ -17,7 +17,7 @@ mode: paper
 # --- Exchange connectors ------------------------------------------------------
 exchanges:
   okx:
-    enabled: true
+    enabled: false                         # disabled: current IP not whitelisted on OKX API key
     # Endpoint selection is driven by `mode`:
     #   testnet → wspap.okx.com:8443/ws/v5/public?brokerId=9999 (demo)
     #   live    → ws.okx.com:8443/ws/v5/public
