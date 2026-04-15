@@ -155,10 +155,12 @@ def test_funding_arb_is_skipped_by_ensemble() -> None:
 
 
 def test_sub_threshold_vote_returns_none() -> None:
-    """A net vote < MIN_NET_VOTE (0.25) must not emit a signal."""
+    """A net vote below the configured min_net_vote must not emit a signal."""
     cfg = _make_regime_config()
     rc = _FixedRegimeClassifier(cfg, Regime.TREND_HIGH_VOL)
-    mom = _FakeStrategy("momentum", [_sig("momentum", OrderSide.BUY, 0.2)])
+    # Weighted contribution = 0.15 × 1.0 = 0.15 which is below the default
+    # min_net_vote of 0.20 in the Ensemble, so nothing should be emitted.
+    mom = _FakeStrategy("momentum", [_sig("momentum", OrderSide.BUY, 0.15)])
     ens = Ensemble(strategies=[mom], regime_classifier=rc)
 
     ts = datetime(2026, 4, 9, 12, 0, tzinfo=UTC)
