@@ -1,0 +1,44 @@
+# ==============================================================================
+# Cryprobotik — pinned runtime dependencies
+# Python 3.12+
+# ==============================================================================
+
+# --- Exchange access ---
+ccxt>=4.4.30                    # async REST client for OKX + Bybit (v5 APIs)
+websockets==13.1                # native WS client (we implement v5 protocols ourselves)
+
+# --- Async infra ---
+aiohttp==3.10.10                # required transitively by ccxt async
+uvloop==0.21.0 ; sys_platform != "win32"   # drop-in faster event loop on Linux/macOS
+tenacity==9.0.0                 # exponential-backoff retry decorator for REST calls
+
+# --- Data & indicators ---
+numpy>=2.2.6
+pandas>=2.3.2
+pandas-ta>=0.4.67b0             # TA indicators (ATR/RSI/EMA/MACD/ADX/BB/Keltner/Donchian)
+scipy==1.14.1                   # for correlation matrices in risk/limits.py
+scikit-learn>=1.5.0             # ML signal filter (GradientBoostingClassifier)
+
+# --- Config & validation ---
+pydantic==2.9.2
+pydantic-settings==2.6.1
+pyyaml==6.0.2
+
+# --- Database ---
+asyncpg==0.30.0                 # async PostgreSQL/TimescaleDB driver
+
+# --- Observability ---
+structlog==24.4.0
+prometheus-client==0.21.0
+fastapi==0.115.4
+uvicorn[standard]==0.32.0
+
+# --- Notifications ---
+python-telegram-bot[rate-limiter]==21.6
+
+# --- Dev & testing ---
+pytest==8.3.3
+pytest-asyncio==0.24.0
+pytest-mock==3.14.0
+ruff==0.7.1
+mypy==1.13.0

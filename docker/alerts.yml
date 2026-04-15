@@ -1,0 +1,42 @@
+groups:
+  - name: cryprobotik
+    rules:
+      - alert: BotHalted
+        expr: cryprobotik_halt_state == 2
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Kill switch tripped — no new trades"
+
+      - alert: DrawdownWarning
+        expr: cryprobotik_drawdown_pct > 0.15
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Drawdown {{ $value | humanizePercentage }} from day start"
+
+      - alert: WSDisconnected
+        expr: cryprobotik_ws_connected == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "WebSocket {{ $labels.exchange }}/{{ $labels.channel }} disconnected"
+
+      - alert: OrderRejectionSpike
+        expr: rate(cryprobotik_orders_rejected_total[5m]) > 0.5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High order rejection rate"
+
+      - alert: StaleMarketData
+        expr: time() - cryprobotik_last_bar_timestamp_seconds > 300
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No new bars for {{ $labels.symbol }}/{{ $labels.timeframe }} in 5 min"

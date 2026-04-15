@@ -1,0 +1,34 @@
+[project]
+name = "cryprobotik"
+version = "0.1.0"
+description = "Autonomous multi-exchange crypto perpetual-futures trading bot (OKX + Bybit)"
+requires-python = ">=3.12"
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "ASYNC", "RUF"]
+ignore = [
+    "E501",  # line length handled by formatter
+    "B008",  # FastAPI / typer use function-call defaults
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+ignore_missing_imports = true    # pandas_ta, ccxt type stubs are incomplete
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-v --strict-markers"
+markers = [
+    "integration: tests that hit real exchange testnet endpoints",
+    "slow: tests that take >5s",
+]

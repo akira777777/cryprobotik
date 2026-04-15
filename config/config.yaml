@@ -1,0 +1,184 @@
+# ==============================================================================
+# Cryprobotik — main configuration
+# ==============================================================================
+# Secrets (API keys, passwords, tokens) come from environment variables, NOT from
+# this file. See `.env.example` for the list of required env vars.
+#
+# All numeric risk parameters below have HARD CEILINGS enforced in src/settings.py.
+# Attempting to load a config that exceeds a ceiling will refuse to start.
+# ==============================================================================
+
+# --- Runtime mode -------------------------------------------------------------
+# testnet : connect to exchange demo / testnet endpoints. No real money.
+# paper   : connect to LIVE mainnet data, simulate fills locally.
+# live    : connect to LIVE mainnet, place REAL orders. Requires --confirm-live CLI flag.
+mode: paper
+
+# --- Exchange connectors ------------------------------------------------------
+exchanges:
+  okx:
+    enabled: true
+    # Endpoint selection is driven by `mode`:
+    #   testnet → wspap.okx.com:8443/ws/v5/public?brokerId=9999 (demo)
+    #   live    → ws.okx.com:8443/ws/v5/public
+    rest_rate_limit_per_sec: 8           # soft cap; real OKX public limits are higher
+    ws_ping_interval_sec: 20
+    ws_reconnect_max_backoff_sec: 30
+
+  bybit:
+    enabled: false
+    # Endpoint selection is driven by `mode`:
+    #   testnet → stream-testnet.bybit.com/v5/public/linear
+    #   live    → stream.bybit.com/v5/public/linear
+    rest_rate_limit_per_sec: 10
+    ws_ping_interval_sec: 20
+    ws_reconnect_max_backoff_sec: 30
+
+# --- Instrument universe ------------------------------------------------------
+universe:
+  top_n: 10                              # top N perpetuals by 24h USD volume
+  refresh_interval_hours: 4              # reselect universe every N hours
+  quote_currency: USDT
+  instrument_type: swap                  # perpetual futures
+  # Symbols that must ALWAYS be traded regardless of the top-N ranking.
+  # Keeps BTC/ETH in scope even on illiquid days.
+  force_include:
+    - BTC/USDT:USDT
+    - ETH/USDT:USDT
+  # Symbols that must NEVER be traded (blacklist).
+  force_exclude: []
+
+# --- Strategies ---------------------------------------------------------------
+strategies:
+  momentum:
+    enabled: true
+    timeframes: ["15m", "1h", "4h"]
+    ema_fast: 9
+    ema_mid: 21
+    ema_slow: 55
+    rsi_period: 14
+    rsi_long_threshold: 50
+    rsi_short_threshold: 50
+    macd_fast: 12
+    macd_slow: 26
+    macd_signal: 9
+    base_confidence: 0.6
+    volume_multiplier: 1.2                 # require 1.2x avg volume on momentum entries
+
+  mean_reversion:
+    enabled: true
+    timeframe: "15m"
+    bb_period: 20
+    bb_std: 2.0
+    rsi_period: 2
+    rsi_long_threshold: 15               # RSI(2) < 15 = deep oversold
+    rsi_short_threshold: 85
+    adx_max: 25                          # only trade mean reversion in ranging markets
+    base_confidence: 0.55
+
+  funding_arb:
+    enabled: true
+    min_rate_delta: 0.0005               # 5 bps absolute delta between venues
+    min_notional_usd: 200                # don't open tiny arb positions
+    close_before_funding_sec: 60
+    base_confidence: 0.8                 # high confidence — near-deterministic PnL
+
+  vwap:
+    enabled: true
+    timeframe: "15m"
+    ema_period: 50
+    vwap_band_pct: 0.001             # 0.1% band around VWAP for touch detection
+    base_confidence: 0.60
+
+  volatility_breakout:
+    enabled: true
+    timeframe: "1h"
+    donchian_period: 20
+    squeeze_atr_ratio_max: 0.8           # range-over-ATR below this = compression
+    squeeze_bars: 4                      # need N bars of compression
+    volume_multiple: 1.5                 # breakout bar volume > 1.5x 20-bar avg
+    base_confidence: 0.65
+
+# --- Market regime classifier -------------------------------------------------
+regime:
+  adx_period: 14
+  adx_trend_threshold: 25                # ADX > this = trending
+  adx_range_threshold: 20                # ADX < this = ranging; between = chop
+  vol_window_bars: 96                    # ~24h of 15m bars for realized vol
+  vol_high_threshold: 0.015              # 1.5% bar stdev = high vol
+  # Regime → strategy weight matrix. Signals are aggregated by weighted confidence.
+  min_net_vote: 0.20                       # lowered from 0.30 — was too restrictive, blocked all chop trades
+  weights:
+    trend_high_vol:   { momentum: 1.0, volatility_breakout: 1.0, mean_reversion: 0.0, funding_arb: 1.0, funding_contrarian: 0.7, vwap: 0.5 }
+    trend_low_vol:    { momentum: 0.9, volatility_breakout: 0.5, mean_reversion: 0.0, funding_arb: 1.0, funding_contrarian: 0.5, vwap: 0.7 }
+    range_high_vol:   { momentum: 0.2, volatility_breakout: 0.3, mean_reversion: 1.0, funding_arb: 1.0, funding_contrarian: 0.6, vwap: 1.0 }
+    range_low_vol:    { momentum: 0.0, volatility_breakout: 0.1, mean_reversion: 1.0, funding_arb: 1.0, funding_contrarian: 0.3, vwap: 1.0 }
+    chop:             { momentum: 0.0, volatility_breakout: 0.0, mean_reversion: 0.3, funding_arb: 1.0, funding_contrarian: 0.4, vwap: 0.5 }
+
+# --- Risk management (hard limits) --------------------------------------------
+risk:
+  # HARD CEILINGS (enforced in settings.py — cannot be increased):
+  #   max_daily_drawdown_pct ≤ 0.30
+  #   risk_per_trade_pct     ≤ 0.05
+  #   leverage               ≤ 10
+  max_daily_drawdown_pct: 0.30           # kill switch trip level
+  warning_drawdown_pct: 0.15             # send Telegram WARN at this level
+  risk_per_trade_pct: 0.02               # 2% of equity at risk per trade (SL distance)
+  max_open_positions: 4
+  max_positions_per_symbol: 1
+  leverage: 3
+  sl_atr_multiplier: 1.5
+  min_reward_to_risk: 2.0
+  max_correlation: 0.80                  # reject new position if corr w/ existing > this
+  correlation_lookback_bars: 720         # ~30d of 1h bars
+  # Reserved buffer — never use more than this fraction of free margin.
+  max_margin_utilization: 0.70
+  # If true: on SIGTERM, flatten all positions before exit. Default false — only
+  # the kill switch should flatten positions.
+  flatten_on_shutdown: false
+
+# --- Execution ----------------------------------------------------------------
+execution:
+  max_retries: 5
+  retry_base_seconds: 0.5                # base for exponential backoff
+  retry_jitter_seconds: 0.25
+  order_timeout_sec: 10                  # cancel if not acknowledged within this
+  default_order_type: market             # market | limit
+  slippage_tolerance_bps: 15             # 0.15% — reject fills beyond this from mid
+
+# --- Paper trading simulator --------------------------------------------------
+paper:
+  starting_balance_usd: 10000.0
+  slippage_bps: 5                        # 0.05% slippage applied to every fill
+  taker_fee_bps: 6                       # 0.06% (typical perp taker fee)
+  maker_fee_bps: 2
+
+# --- Notifications ------------------------------------------------------------
+notifications:
+  telegram:
+    enabled: true
+    # Which severity levels to forward to Telegram.
+    levels: [INFO, WARN, CRITICAL]
+    # Daily report posted at this UTC hour.
+    daily_report_hour_utc: 0
+    # Commands accepted from authorized chat IDs.
+    enable_commands: true
+
+# --- Database -----------------------------------------------------------------
+database:
+  # url comes from env DATABASE_URL
+  pool_min: 2
+  pool_max: 10
+  statement_cache_size: 1024
+
+# --- Monitoring ---------------------------------------------------------------
+monitoring:
+  health_port: 8080
+  prometheus_enabled: true
+  reconcile_interval_sec: 30             # portfolio tracker reconciliation period
+
+# --- Logging ------------------------------------------------------------------
+logging:
+  level: INFO                            # DEBUG | INFO | WARN | ERROR
+  format: json                           # json (prod) or console (dev)
+  mirror_to_db: true                     # also write WARN+ events to events table

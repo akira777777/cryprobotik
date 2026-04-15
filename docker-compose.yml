@@ -1,0 +1,86 @@
+# ==============================================================================
+# Cryprobotik stack
+#
+# Default profile starts: bot + timescaledb
+# Optional profile `observability` also starts: prometheus + grafana
+#
+#   docker compose up -d                          # bot + db only
+#   docker compose --profile observability up -d  # + prometheus + grafana
+# ==============================================================================
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: cryprobotik-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-cryprobotik}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-cryprobotik}
+      # TimescaleDB tuning for small VPS (1-2 GB RAM). Adjust for larger boxes.
+      TS_TUNE_MEMORY: 1GB
+      TS_TUNE_NUM_CPUS: 2
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cryprobotik} -d ${POSTGRES_DB:-cryprobotik}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    ports:
+      # Exposed on loopback only so you can psql from the host for debugging.
+      # Remove this block entirely for a prod deployment.
+      - "127.0.0.1:5432:5432"
+
+  bot:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: cryprobotik:latest
+    container_name: cryprobotik-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:${HEALTH_PORT:-8080}:8080"
+    volumes:
+      - ./config:/app/config:ro
+      - botlogs:/app/logs
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: cryprobotik-prometheus
+    restart: unless-stopped
+    profiles: ["observability"]
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.2.2
+    container_name: cryprobotik-grafana
+    restart: unless-stopped
+    profiles: ["observability"]
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  pgdata:
+  botlogs:
+  prometheus_data:
+  grafana_data:

@@ -1,0 +1,53 @@
+# Secrets
+.env
+*.env.local
+secrets/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.venv*/
+venv/
+env/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Node (miniapp / supabase helpers)
+node_modules/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Runtime artifacts
+logs/
+data/
+*.sqlite
+*.db
+*.db-journal
+bot.log
+bot.log.*
+*.log
+
+# Agentic / MCP tool state (local dev only)
+.claude-flow/
+.kilo/
+.kube/
+.swarm/
+.claude/settings.local.json
+.claude/settings.local.*
+
+# Docker volumes (when bind-mounted locally)
+pgdata/
+prometheus_data/
+grafana_data/
+
+# OS
+.DS_Store
+Thumbs.db
