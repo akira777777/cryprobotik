@@ -1,47 +1,22 @@
 # AGENTS.md
 
-Guidance for agentic coding agents working in the **cryprobotik** repository — an autonomous multi-exchange (OKX + Bybit) crypto perpetual-futures trading bot. Read `CLAUDE.md` first for runtime architecture (signal pipeline, exchange layer, risk modules). This file covers commands and code style.
+Guidance for agentic coding agents working in the **cryprobotik** repository — an autonomous multi-exchange (OKX + Bybit) crypto perpetual-futures trading bot.
 
-## Build / lint / test commands
+**Read [`CLAUDE.md`](CLAUDE.md) first** — it has the full runtime architecture (signal pipeline, exchange layer, risk modules), complete command reference, key gotchas, and deployment instructions. This file adds coding-convention detail that agents need when writing or reviewing code.
+
+## Commands quick-reference
 
 ```bash
-# Unit tests (no exchange access, no DB) — DEFAULT before any commit
-pytest -v -m "not integration"
-
-# Single test file
-pytest tests/test_risk_manager.py -v
-
-# Single test by node-id (function or class::function)
-pytest tests/test_ensemble.py::test_confidence_capped_at_one -v
-pytest tests/test_kill_switch.py::TestKillSwitch::test_halt_survives_day_boundary -v
-
-# Filter by keyword across all tests
-pytest -v -m "not integration" -k "regime and hysteresis"
-
-# Integration tests (require live testnet API keys in .env)
-pytest -v -m integration
-
-# Lint + auto-fix
-ruff check src/ tests/ --fix
-ruff format src/ tests/
-
-# Type-check (strict mode, pydantic plugin enabled)
-mypy src/
-
-# Apply DB schema (idempotent)
-python -m src.data.storage --apply-schema
-
-# Run bot — paper mode is the SAFE default
-python -m src.main --mode paper
-# Live mode REQUIRES both flags — never omit --confirm-live
-python -m src.main --mode live --confirm-live
-
-# Docker (rebuild after .py changes; restart only suffices for .env / config.yaml)
-docker compose build bot && docker compose up -d bot
-docker compose logs -f bot
+pytest -v -m "not integration"            # unit tests — run before every commit
+ruff check src/ tests/ --fix              # lint + auto-fix
+ruff format src/ tests/                   # format
+mypy src/                                 # type-check (strict)
+python -m src.main --mode paper           # start bot in paper mode (safe)
 ```
 
-`pytest.ini_options.asyncio_mode = "auto"` is set in `pyproject.toml`, so async tests run without `@pytest.mark.asyncio`. Use `@pytest.mark.integration` to mark exchange-touching tests.
+For the full command list (Docker, DB schema, backtest, localtunnel, etc.) see [`CLAUDE.md §Commands`](CLAUDE.md).
+
+`pytest.ini_options.asyncio_mode = "auto"` in `pyproject.toml` — async tests run without `@pytest.mark.asyncio`. Coverage gate: 60% on `src/` (enforced in `pyproject.toml [tool.coverage.report]`).
 
 ## Code style
 

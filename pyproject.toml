@@ -32,3 +32,19 @@ markers = [
     "integration: tests that hit real exchange testnet endpoints",
     "slow: tests that take >5s",
 ]
+
+[tool.coverage.run]
+source = ["src"]
+omit = [
+    "src/main.py",          # entry-point, needs full env to import
+    "src/data/storage.py",  # asyncpg — integration-only
+]
+
+[tool.coverage.report]
+fail_under = 60
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]

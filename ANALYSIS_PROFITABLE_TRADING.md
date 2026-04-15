@@ -1,5 +1,25 @@
 # Cryprobotik: Profitability Analysis & Improvement Roadmap
 
+> **Status as of 2026-04-15** — Implementation plan: `peppy-popping-bee.md`
+>
+> Items **completed** since this analysis was written:
+> - §1.1 `min_net_vote` lowered to 0.20 ✓
+> - §1.2 Exit management (`src/execution/exit_manager.py`) — breakeven, trailing SL, partial TP, time exit ✓
+> - §1.5 Hurst exponent in RegimeClassifier ✓
+> - §1.6 FundingContrarianStrategy with trend veto + falling-knife veto ✓
+> - §2.3 CVD store integrated into ML features ✓
+> - §2.4 OI rate-of-change store + LiquidationCascadeStrategy ✓
+> - §3 Backtester framework (`src/backtest/engine.py` + `scripts/run_backtest.py`) ✓
+> - §5.3 VWAP strategy ✓
+>
+> Items **still pending** (see `peppy-popping-bee.md` for details):
+> - §1.3 LightGBM regressor + R-multiple target (P2.1)
+> - §1.4 Bybit funding-arb drill — config enabled, awaiting API keys in `.env` (P1.3)
+> - §2.3 Additional ML features: orderbook imbalance, BTC dominance (P2.1)
+> - §3 Walk-forward validation (P2.3)
+
+---
+
 ## Executive Summary
 
 After a full audit of the codebase, config, strategies, ML pipeline, and risk layer — here's the honest assessment: **the architecture is solid but the bot is currently configured to be conservative to the point of inaction, and it's missing several high-edge strategy classes that dominate perp futures markets.** The ML filter with only 25 features and GradientBoosting is a decent start but leaves significant alpha on the table. Below is everything broken into what's wrong, what to add, and how to tune it.

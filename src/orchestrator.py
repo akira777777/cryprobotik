@@ -1009,6 +1009,10 @@ class Orchestrator:
             meta=signal.meta,
         )
 
+        # Stash risk_usd so MLSignalFilter can compute R-multiple when the fill comes back.
+        if self._ml_filter is not None:
+            self._ml_filter.update_pending_risk(symbol, signal.side, sized.risk_usd)
+
         # Execute
         result = await self._executor.execute(sized, signal_id=signal_id)
         if result is not None and self._exit_manager is not None:

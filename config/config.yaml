@@ -132,10 +132,10 @@ risk:
   #   leverage               ≤ 10
   max_daily_drawdown_pct: 0.30           # kill switch trip level
   warning_drawdown_pct: 0.15             # send Telegram WARN at this level
-  risk_per_trade_pct: 0.02               # 2% of equity at risk per trade (SL distance)
+  risk_per_trade_pct: 0.01               # 1% of equity at risk per trade (SL distance) — P2.3: tighter sizing at higher leverage
   max_open_positions: 4
   max_positions_per_symbol: 1
-  leverage: 3
+  leverage: 5                            # P2.3: raised from 3 → 5 per ANALYSIS §3; net notional exposure unchanged
   sl_atr_multiplier: 1.5
   min_reward_to_risk: 2.0
   max_correlation: 0.80                  # reject new position if corr w/ existing > this

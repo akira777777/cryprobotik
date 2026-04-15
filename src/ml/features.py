@@ -1,7 +1,7 @@
 """
 Feature extraction for ML signal scoring.
 
-Computes a fixed 23-element float vector from a FeatureStore snapshot + Signal.
+Computes a fixed 28-element float vector from a FeatureStore snapshot + Signal.
 Uses pure pandas/numpy — no pandas-ta — to stay fast on the hot path.
 
 Feature layout:
@@ -11,12 +11,16 @@ Feature layout:
   [13-17] regime one-hot (5 binary flags: trend_high_vol … chop)
   [18-21] time features (hour sin/cos, weekday sin/cos)
   [22]    4h ATR ratio
+  [23-24] perp-native signals (CVD ratio, OI ROC)
+  [25-27] volume ratios (current bar volume / 20-bar avg) across 15m, 1h, 4h
 
 Note: ensemble meta-outputs (net_vote, weighted_long, weighted_short,
 confidence) were removed in FEATURE_VERSION 2 to prevent the ML filter
 from degenerating into a replica of the ensemble's confidence ranking.
 Volume context and strategy_encoded features were consolidated in v2 as
-well to keep the vector compact (23 features).
+well to keep the vector compact. Version 4 adds volume ratio features across
+three timeframes, providing buy/sell pressure context that neither RSI nor MACD
+captures (especially useful for liquidity cascades and breakout confirmation).
 """
 
 from __future__ import annotations
@@ -89,12 +93,16 @@ FEATURE_NAMES: list[str] = [
     # perp-native signals (2 features) — added in FEATURE_VERSION 3
     "cvd_ratio",   # taker buy fraction [0, 1]; 0.5 = neutral
     "oi_roc",      # open-interest rate-of-change (normalised)
+    # volume ratios (3 features) — added in FEATURE_VERSION 4
+    "vol_ratio_15m",  # current bar volume / 20-bar mean (15m)
+    "vol_ratio_1h",   # current bar volume / 20-bar mean (1h)
+    "vol_ratio_4h",   # current bar volume / 20-bar mean (4h)
 ]
 
-N_FEATURES: int = len(FEATURE_NAMES)  # 25
+N_FEATURES: int = len(FEATURE_NAMES)  # 28
 # Bump this whenever the feature vector layout changes so persisted models
 # are automatically discarded and a fresh cold start begins.
-FEATURE_VERSION: int = 3
+FEATURE_VERSION: int = 4
 
 
 # ─────────────────────── indicator helpers ───────────────────────
@@ -333,6 +341,13 @@ def extract_features(
         raw_roc = oi_store.oi_roc(exchange, signal.symbol, periods=5)
         f24 = max(-0.1, min(0.1, raw_roc))
 
+    # ── volume ratios — added in FEATURE_VERSION 4 ─────────────────────────
+    # Current bar volume / 20-bar average volume on each timeframe.
+    # >1 = volume expansion; <1 = contraction; clamped to [0, 5] for stability.
+    f25 = max(0.0, min(5.0, _safe_df_feature(_vol_ratio, df15, default=1.0)))
+    f26 = max(0.0, min(5.0, _safe_df_feature(_vol_ratio, df1h, default=1.0)))
+    f27 = max(0.0, min(5.0, _safe_df_feature(_vol_ratio, df4h, default=1.0)))
+
     result = [
         f0, f1, f2, f3, f4, f5, f6,
         f7, f8, f9, f10,
@@ -341,6 +356,7 @@ def extract_features(
         f18, f19, f20, f21,
         f22,
         f23, f24,
+        f25, f26, f27,
     ]
 
     # ── cache store ───────────────────────────────────────

@@ -2,11 +2,20 @@
 ML-based signal filter.
 
 Sits between Ensemble output and RiskManager. Scores each consolidated Signal
-with a GradientBoosting classifier trained on past trade outcomes.
+with a LightGBM regressor trained to predict trade R-multiples.
+
+The target variable is `realized_pnl / risk_usd` — positive values mean
+profitable trades, negative means losers. A signal is accepted when the
+predicted R-multiple ≥ MIN_EXPECTED_R (default 0.5).
+
+Using R-multiple regression rather than binary win/loss classification
+aligns the model's incentive with actual profitability: a +3R winner is
+treated as much better than a +0.1R winner, preventing the model from
+optimising for marginal wins.
 
 Lifecycle:
-  Cold start  (< MIN_SAMPLES labels): pass-through, score = 0.5
-  Warm        (≥ MIN_SAMPLES):        filter signals below ACCEPT_THRESHOLD
+  Cold start  (< MIN_SAMPLES labels): pass-through, predicted R = 0.5 → accept
+  Warm        (≥ MIN_SAMPLES):        filter signals with predicted R < MIN_EXPECTED_R
   Retrain     every RETRAIN_EVERY new labels; runs in a thread pool
 
 State persistence: model + training buffer persisted to bot_state DB table as
@@ -46,10 +55,11 @@ def _verify_model(secret: bytes, data: bytes, expected: str) -> bool:
 
 
 MIN_SAMPLES: int = 50  # labels needed before first training run
-RETRAIN_EVERY: int = 20  # retrain after every N new labels
-ACCEPT_THRESHOLD: float = 0.60  # ML pass gate; cold start is always 0.5 → accept
+RETRAIN_EVERY: int = 50  # retrain after every N new labels (raised from 20 for stability)
+MIN_EXPECTED_R: float = 0.5  # predicted R-multiple must be ≥ this to accept a signal
+ACCEPT_THRESHOLD: float = MIN_EXPECTED_R  # alias — used in tests and healthcheck
 FEE_FLOOR_PCT: float = 0.001  # skip labels within this fraction of entry notional (fee noise)
-ML_BUFFER_MAX: int = 500  # max training examples kept in memory and persisted
+ML_BUFFER_MAX: int = 2000  # max training examples kept in memory and persisted (raised from 500)
 BOT_STATE_KEY = "ml.model_state"
 
 
@@ -90,13 +100,16 @@ class MLSignalFilter:
         self._online_model = None
         self._online_model_samples: int = 0
 
-        # Training buffer — list of feature vectors and labels
+        # Training buffer — feature vectors and R-multiple labels (float since v4)
         self._X: list[list[float]] = []
-        self._y: list[int] = []
+        self._y: list[float] = []  # R-multiple: realized_pnl / risk_usd
         self._new_since_retrain: int = 0
 
         # Pending features keyed by (symbol, side_value) while trade is open
         self._pending: dict[tuple[str, str], list[float]] = {}
+        # Pending risk_usd — stored separately so store_pending() doesn't need
+        # to be moved after sizing in the orchestrator.
+        self._pending_risk: dict[tuple[str, str], float] = {}
 
         # SSE subscribers: set so discard() is O(1) and never raises.
         self._sse_queues: set[asyncio.Queue[str]] = set()
@@ -179,13 +192,13 @@ class MLSignalFilter:
             log.warning("ml.load_failed", error=str(exc))
             self._model = None
 
-        # Initialize River online model if available. The ARF classifier
-        # learns after every trade outcome via learn_one() — much faster
-        # adaptation than waiting for RETRAIN_EVERY sklearn retrains.
+        # Initialize River online model if available. The ARF regressor
+        # learns R-multiple after every trade outcome — much faster adaptation
+        # than waiting for RETRAIN_EVERY LightGBM retrains.
         try:
-            from river.ensemble import AdaptiveRandomForestClassifier
-            self._online_model = AdaptiveRandomForestClassifier()
-            log.info("ml.online_model_initialized", backend="river.AdaptiveRandomForestClassifier")
+            from river.forest import ARFRegressor
+            self._online_model = ARFRegressor()
+            log.info("ml.online_model_initialized", backend="river.ARFRegressor")
         except ImportError:
             self._online_model = None
             log.debug("ml.online_model_unavailable", reason="river not installed")
@@ -205,32 +218,30 @@ class MLSignalFilter:
         cold = features is None or self._model is None
 
         if cold:
-            score = 0.5
+            # Pass-through during cold start; score = threshold so it's
+            # clear in logs that this is the default, not a real prediction.
+            score = self._threshold
             accepted = True
         else:
             try:
-                proba = self._model.predict_proba([features])[0]
-                classes = list(self._model.classes_)
-                pos_idx = classes.index(1) if 1 in classes else -1
-                sklearn_score = float(proba[pos_idx]) if pos_idx >= 0 else 0.5
+                # LightGBM regressor predicts R-multiple directly.
+                lightgbm_r = float(self._model.predict([features])[0])
             except Exception as exc:
                 log.warning("ml.score_error", error=str(exc))
-                sklearn_score = 0.5
+                lightgbm_r = self._threshold
 
-            # Blend with River online model when it has enough samples.
-            # sklearn (GBT) is the primary signal (60%); river ARF adds
-            # recency sensitivity (40%) without destabilizing cold scoring.
+            # Blend with River online ARF regressor when it has enough samples.
+            # LightGBM (60%) is the primary; River ARF (40%) adds recency
+            # sensitivity without destabilising the cold-start pass-through.
             if self._online_model is not None and self._online_model_samples >= 10:
                 try:
-                    online_score = self._online_model.predict_proba_one(
-                        dict(enumerate(features))
-                    ).get(1, 0.5)
-                    score = 0.6 * sklearn_score + 0.4 * online_score
+                    online_r = self._online_model.predict_one(dict(enumerate(features))) or 0.0
+                    score = 0.6 * lightgbm_r + 0.4 * online_r
                 except Exception as exc:
                     log.warning("ml.online_score_error", error=str(exc))
-                    score = sklearn_score
+                    score = lightgbm_r
             else:
-                score = sklearn_score
+                score = lightgbm_r
 
             accepted = score >= self._threshold
 
@@ -263,6 +274,12 @@ class MLSignalFilter:
         """Remember the features for an open trade so we can label it on close."""
         self._pending[(symbol, side.value)] = features
 
+    def update_pending_risk(self, symbol: str, side: "OrderSide", risk_usd: float) -> None:
+        """Store the dollar risk for an open trade (called after RiskManager sizing)."""
+        key = (symbol, side.value)
+        if key in self._pending:
+            self._pending_risk[key] = risk_usd
+
     # ─────────────────────── outcome recording ───────────────────────
 
     async def record_outcome(
@@ -272,10 +289,17 @@ class MLSignalFilter:
         realized_pnl: float,
         entry_notional: float = 0.0,
     ) -> None:
-        """Called when a trade closes. Labels the training example and maybe retrains."""
-        features = self._pending.pop((symbol, side.value), None)
+        """Called when a trade closes. Labels the training example and maybe retrains.
+
+        The label is the R-multiple (realized_pnl / risk_usd).  When risk_usd is
+        not available (position opened before ML was active), falls back to ±1.0.
+        """
+        key = (symbol, side.value)
+        features = self._pending.pop(key, None)
         if features is None:
             return  # no matching pending signal (e.g. position from before ML was active)
+
+        risk_usd = self._pending_risk.pop(key, 0.0)
 
         # Skip near-breakeven labels — round-trip fees create a dead zone where
         # the sign of PnL is determined by noise, not signal quality.
@@ -283,10 +307,18 @@ class MLSignalFilter:
             log.debug("ml.outcome_skipped_deadzone", symbol=symbol, pnl=round(realized_pnl, 6))
             return
 
-        label = 1 if realized_pnl > 0.0 else 0
+        # R-multiple: positive = winner, negative = loser, magnitude = quality
+        if risk_usd > 0.0:
+            r_label = realized_pnl / risk_usd
+        else:
+            r_label = 1.0 if realized_pnl > 0.0 else -1.0  # fallback without risk_usd
+
+        # Clamp to a reasonable range to prevent outliers from destabilising training.
+        r_label = max(-5.0, min(10.0, r_label))
+
         async with self._lock:
             self._X.append(features)
-            self._y.append(label)
+            self._y.append(r_label)
             # Keep buffer bounded — consistent with the persisted window so a restarted
             # session behaves identically to a long-running one.
             if len(self._X) > ML_BUFFER_MAX:
@@ -294,11 +326,11 @@ class MLSignalFilter:
                 self._y = self._y[-ML_BUFFER_MAX:]
             self._new_since_retrain += 1
 
-        # Online learning: River ARF learns immediately after every outcome.
+        # Online learning: River ARF regressor learns immediately after every outcome.
         # This gives sub-sample adaptation without waiting for RETRAIN_EVERY.
         if self._online_model is not None:
             try:
-                self._online_model.learn_one(dict(enumerate(features)), label)
+                self._online_model.learn_one(dict(enumerate(features)), r_label)
                 self._online_model_samples += 1
             except Exception as exc:
                 log.warning("ml.online_learn_error", error=str(exc))
@@ -307,7 +339,8 @@ class MLSignalFilter:
             "ml.outcome",
             symbol=symbol,
             pnl=round(realized_pnl, 4),
-            label=label,
+            r_label=round(r_label, 3),
+            risk_usd=round(risk_usd, 2),
             n_samples=len(self._y),
         )
 
@@ -337,11 +370,14 @@ class MLSignalFilter:
             _m.ml_training_samples_gauge.set(len(y_snap))
             _m.ml_model_version_gauge.set(self._model_version)
 
+            avg_r = round(sum(y_snap) / len(y_snap), 3)
+            win_rate = round(sum(1 for r in y_snap if r > 0) / len(y_snap), 3)
             log.info(
                 "ml.model_retrained",
                 version=self._model_version,
                 n_samples=len(y_snap),
-                win_rate=round(sum(y_snap) / len(y_snap), 3),
+                avg_r_multiple=avg_r,
+                win_rate=win_rate,
             )
             await self._persist()
         except Exception as exc:
@@ -457,13 +493,16 @@ class MLSignalFilter:
 
     def stats(self) -> dict[str, Any]:
         n = len(self._y)
-        wins = sum(self._y)
+        wins = sum(1 for r in self._y if r > 0)
+        avg_r = round(sum(self._y) / n, 3) if n > 0 else None
         imps = self._feature_importances()
         return {
             "model_version": self._model_version,
             "n_samples": n,
             "n_profitable": wins,
             "win_rate": round(wins / n, 3) if n > 0 else None,
+            "avg_r_multiple": avg_r,
+            "min_expected_r": self._threshold,
             "cold_start": self._model is None,
             "accept_threshold": self._threshold,
             "feature_importances": imps,
@@ -477,6 +516,7 @@ class MLSignalFilter:
         if self._model is None:
             return None
         try:
+            # LightGBM regressor inside sklearn Pipeline — access via named_steps.
             clf = self._model.named_steps["clf"]
             imp = clf.feature_importances_
             return {name: round(float(v), 4) for name, v in zip(FEATURE_NAMES, imp)}
@@ -487,9 +527,14 @@ class MLSignalFilter:
 # ─────────────────────── CPU-bound training ───────────────────────
 
 
-def _fit_model(X: list[list[float]], y: list[int]):
-    """Called in a thread pool. Returns a fitted sklearn Pipeline."""
-    from sklearn.ensemble import GradientBoostingClassifier
+def _fit_model(X: list[list[float]], y: list[float]):
+    """Called in a thread pool. Returns a fitted sklearn Pipeline.
+
+    Trains a LightGBM regressor to predict R-multiple (realized_pnl / risk_usd).
+    LightGBM is substantially faster than GradientBoostingClassifier on large
+    buffers (2000 examples) and handles sparse/noisy financial data well.
+    """
+    from lightgbm import LGBMRegressor
     from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import StandardScaler
 
@@ -498,12 +543,15 @@ def _fit_model(X: list[list[float]], y: list[int]):
             ("scaler", StandardScaler()),
             (
                 "clf",
-                GradientBoostingClassifier(
-                    n_estimators=100,
-                    max_depth=3,
-                    learning_rate=0.1,
+                LGBMRegressor(
+                    n_estimators=200,
+                    max_depth=4,
+                    learning_rate=0.05,
                     subsample=0.8,
+                    num_leaves=31,
+                    min_child_samples=10,
                     random_state=42,
+                    verbose=-1,       # suppress LightGBM training output
                 ),
             ),
         ]

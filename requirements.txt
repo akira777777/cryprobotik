@@ -18,7 +18,8 @@ numpy>=2.2.6
 pandas>=2.3.2
 pandas-ta>=0.4.67b0             # TA indicators (ATR/RSI/EMA/MACD/ADX/BB/Keltner/Donchian)
 scipy==1.14.1                   # for correlation matrices in risk/limits.py
-scikit-learn>=1.5.0             # ML signal filter (GradientBoostingClassifier)
+scikit-learn>=1.5.0             # ML signal filter pipeline (StandardScaler + LightGBM)
+lightgbm>=4.5.0                 # LGBMRegressor for R-multiple prediction
 
 # --- Config & validation ---
 pydantic==2.9.2
