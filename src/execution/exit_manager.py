@@ -40,6 +40,7 @@ from src.exchanges.base import (
     PositionSide,
 )
 from src.monitoring import prom_metrics as m
+from src.settings import ExitConfig
 from src.utils.logging import get_logger
 from src.utils.time import now_utc
 
@@ -50,38 +51,6 @@ if TYPE_CHECKING:
     from src.settings import ExecutionConfig
 
 log = get_logger(__name__)
-
-
-# ─────────────────────── config ───────────────────────
-
-
-@dataclass(slots=True)
-class ExitConfig:
-    """
-    Parameters for all dynamic exit rules.
-
-    Attribute                  Default   Description
-    ─────────────────────────  ───────   ──────────────────────────────────────
-    atr_period                 14        ATR lookback for trailing stop distance
-    atr_trailing_mult          1.5       Trailing SL = price ± (atr_trailing_mult × ATR)
-    breakeven_trigger_r        1.0       Move SL to entry after this many R gained
-    partial_tp_trigger_r       1.5       Close partial_tp_fraction at this many R
-    partial_tp_fraction        0.5       Fraction of position to close on partial TP
-    trailing_trigger_r         2.0       Start trailing after this many R gained
-    max_bars_open              48        Time-exit after this many 15m bars (~12h)
-    time_exit_min_r            0.5       Time exit fires only if gain < this R
-    check_interval_sec         30.0      How often the loop wakes up to check positions
-    """
-
-    atr_period: int = 14
-    atr_trailing_mult: float = 1.5
-    breakeven_trigger_r: float = 1.0
-    partial_tp_trigger_r: float = 1.5
-    partial_tp_fraction: float = 0.5
-    trailing_trigger_r: float = 2.0
-    max_bars_open: int = 48
-    time_exit_min_r: float = 0.5
-    check_interval_sec: float = 30.0
 
 
 # ─────────────────────── per-position state ───────────────────────
@@ -123,17 +92,31 @@ class ExitManager:
         tracker: "PortfolioTracker",
         feature_store: FeatureStore,
         connectors: dict[str, "ExchangeConnector"],
-        config: ExitConfig | None = None,
+        config: ExitConfig,
     ) -> None:
         self._tracker = tracker
         self._store = feature_store
         self._connectors = connectors
-        self._config = config or ExitConfig()
+        self._config = config
         # (exchange, symbol) → state
         self._states: dict[tuple[str, str], _ExitState] = {}
         self._lock = asyncio.Lock()
 
     # ─────────────────────── public API ───────────────────────
+
+    def on_bar_close(self, exchange: str, symbol: str, timeframe: str) -> None:
+        """Increment bar counter for 15m bars only. Called by kline_pump."""
+        if timeframe != "15m":
+            return
+        key = (exchange, symbol)
+        if key in self._states:
+            self._states[key].bars_open += 1
+            log.debug(
+                "exit_manager.bar_close",
+                exchange=exchange,
+                symbol=symbol,
+                bars_open=self._states[key].bars_open,
+            )
 
     def register_position(
         self,
@@ -214,7 +197,6 @@ class ExitManager:
         if sl_distance <= 0:
             # No original SL recorded — can't compute R; skip dynamic rules but
             # still apply the time exit.
-            state.bars_open += 1
             await self._maybe_time_exit(pos, state, conn, r_multiple=0.0)
             return
 
@@ -224,10 +206,6 @@ class ExitManager:
             price_move = pos.entry_price - current_price
 
         r_multiple = price_move / sl_distance
-
-        # Increment bar count (approximate: loop fires every check_interval_sec;
-        # 15m bars = 900 s, so each fire ≈ check_interval_sec / 900 bars).
-        state.bars_open += 1
 
         # ── Rule 1: Breakeven ──
         if (
