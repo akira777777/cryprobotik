@@ -22,11 +22,13 @@ def test_basic_long_sizing(risk_config: RiskConfig) -> None:
         strategy="momentum", confidence=0.8,
     )
     assert isinstance(result, SizedTrade)
-    # risk_usd = equity * 2% = 200
-    assert result.risk_usd == pytest.approx(200.0)
+    # risk_usd = equity * 2% * confidence_scalar
+    #   confidence_scalar = 0.5 + 0.5 * 0.8 = 0.9
+    #   → 10000 * 0.02 * 0.9 = 180
+    assert result.risk_usd == pytest.approx(180.0)
     # stop distance = atr * 1.5 = 750
-    # qty = 200 / 750 = 0.2667
-    assert result.quantity == pytest.approx(200.0 / 750.0, rel=1e-6)
+    # qty = 180 / 750 = 0.24
+    assert result.quantity == pytest.approx(180.0 / 750.0, rel=1e-6)
     # SL = entry - 750
     assert result.stop_loss == pytest.approx(49250.0)
     # TP = entry + 750 * 1.5 = entry + 1125
