@@ -17,8 +17,10 @@ env/
 htmlcov/
 .coverage
 
-# Node (miniapp / supabase helpers)
+# Node (defensive — Mini App is inline Python, but keep ignored in case future frontends are added)
 node_modules/
+package-lock.json
+pnpm-lock.yaml
 
 # IDE
 .vscode/
@@ -42,6 +44,9 @@ bot.log.*
 .swarm/
 .claude/settings.local.json
 .claude/settings.local.*
+
+# MCP server config — per-developer; check in .mcp.example.json instead
+.mcp.json
 
 # Docker volumes (when bind-mounted locally)
 pgdata/

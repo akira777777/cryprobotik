@@ -2,7 +2,7 @@
 name = "cryprobotik"
 version = "0.1.0"
 description = "Autonomous multi-exchange crypto perpetual-futures trading bot (OKX + Bybit)"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.14"
 
 [tool.ruff]
 line-length = 110
