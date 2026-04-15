@@ -47,7 +47,7 @@ from src.exchanges.bybit import BybitConnector
 from src.exchanges.okx import OKXConnector
 from src.exchanges.paper import PaperConnector
 from src.execution.executor import OrderExecutor
-from src.execution.exit_manager import ExitConfig, ExitManager
+from src.execution.exit_manager import ExitManager
 from src.execution.order_router import OrderRouter
 from src.monitoring import prom_metrics as m
 from src.monitoring.health import LiveBroadcaster, build_app, serve_health
@@ -189,8 +189,14 @@ class Orchestrator:
             or self._connectors.get("paper-bybit")
             or okx_for_universe  # fall back to OKX-only universe if Bybit is disabled
         )
+        # If OKX is disabled but Bybit is up, let Bybit serve as both legs of universe
+        # selection — UniverseSelector will intersect Bybit with itself (no-op), giving a
+        # single-exchange universe. Raise only if no exchange at all is available.
         if okx_for_universe is None:
-            raise RuntimeError("OKX connector is required")
+            if bybit_for_universe is not None:
+                okx_for_universe = bybit_for_universe
+            else:
+                raise RuntimeError("At least one exchange connector is required")
         self._universe = UniverseSelector(
             config=self._settings.config.universe,
             okx=okx_for_universe,
@@ -227,6 +233,7 @@ class Orchestrator:
             tracker=self._tracker,
             feature_store=self._feature_store,
             connectors=self._connectors,
+            config=self._settings.config.exit,
         )
 
         # Strategies + ensemble
@@ -639,6 +646,8 @@ class Orchestrator:
             # Finalise CVD bar-delta on every closed bar (any timeframe, any exchange).
             if evt.closed and self._cvd_store is not None:
                 self._cvd_store.on_bar_close(exchange, evt.symbol)
+            if evt.closed and self._exit_manager is not None:
+                self._exit_manager.on_bar_close(exchange, evt.symbol, evt.timeframe)
 
             # Only evaluate strategies on CLOSED bars of the base timeframe.
             if not evt.closed or evt.timeframe != "15m":
