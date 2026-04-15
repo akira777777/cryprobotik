@@ -61,10 +61,15 @@ class MeanReversionStrategy(Strategy):
         bb = bollinger(df, length=self._bb_period, std=self._bb_std)
         if bb is None or bb.empty:
             return []
-        lower_col = f"BBL_{self._bb_period}_{self._bb_std}"
-        upper_col = f"BBU_{self._bb_period}_{self._bb_std}"
-        if lower_col not in bb.columns or upper_col not in bb.columns:
+        # pandas_ta versions differ in column naming:
+        # older: "BBL_20_2.0"  — newer: "BBL_20_2.0_2.0".
+        # Match by prefix so both work.
+        lower_cols = [c for c in bb.columns if c.startswith(f"BBL_{self._bb_period}_{self._bb_std}")]
+        upper_cols = [c for c in bb.columns if c.startswith(f"BBU_{self._bb_period}_{self._bb_std}")]
+        if not lower_cols or not upper_cols:
             return []
+        lower_col = lower_cols[0]
+        upper_col = upper_cols[0]
 
         last_close = float(df["close"].iloc[-1])
         last_low = float(df["low"].iloc[-1])
