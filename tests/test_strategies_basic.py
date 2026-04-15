@@ -96,13 +96,41 @@ def test_momentum_emits_buy_on_strong_uptrend() -> None:
     """
     A strongly rising 15m series → EMA stack (fast > mid > slow) AND
     a modestly bullish 1h RSI, AND positive 4h MACD histogram.
+
+    A small pullback is injected mid-series so RSI doesn't saturate at 100
+    (which would fail the `r > r_prev` rising-slope check) and so the MACD
+    histogram has non-zero recent stdev plus a positive reading on the last
+    closed bar.
     """
-    # 250 bars, each higher by 1.5
     n = 250
     base = 100.0
-    closes_15m = [base + i * 1.5 for i in range(n)]
-    closes_1h = [base + i * 6.0 for i in range(n)]  # 4x compression
-    closes_4h = [base + i * 24.0 for i in range(n)] # 16x compression
+
+    def _series(slope: float) -> list[float]:
+        """
+        Uptrend with strong pullbacks so RSI(14) settles in a 55-70 band
+        rather than saturating at 100. Ratio of avg gain / avg loss ≈ 1.5
+        gives RSI ≈ 60. Ends with 3 up-bars so RSI and MACD histogram are
+        both rising on the last closed bar.
+        """
+        closes: list[float] = []
+        price = base
+        for i in range(n):
+            # Alternate up bar (+slope * 3.0) and down bar (-slope * 2.0):
+            # gain:loss = 3:2 → RSI ≈ 60. Net drift ≈ +slope * 0.5 per 2 bars.
+            if i % 2 == 0:
+                price += slope * 3.0
+            else:
+                price -= slope * 2.0
+            closes.append(price)
+        # Ensure the last 5 bars trend up cleanly so MACD histogram and
+        # RSI are both rising vs the reference `r_prev = iloc[-5]`.
+        for k in range(5, 0, -1):
+            closes[-k] = closes[-(k + 1)] + slope * 1.0
+        return closes
+
+    closes_15m = _series(0.25)
+    closes_1h = _series(1.0)
+    closes_4h = _series(4.0)
 
     store = FeatureStore()
     _populate_store(store, closes_15m, "15m", 15 * 60)
@@ -251,14 +279,18 @@ def test_volatility_breakout_emits_buy_on_squeeze_breakout() -> None:
     tight_lows   = [c - 0.4 for c in tight_closes]
     normal_vols  = [1000.0] * tight_n
 
-    # iloc[-2]: the big breakout candle — close well above the channel
-    breakout_close = base + 5.0
-    # iloc[-1]: the confirming bar (still above channel), HIGH volume
-    confirm_close = base + 5.2
+    # iloc[-2]: gentle breakout that just clears the tight-range channel.
+    # A LARGE breakout would make the Donchian-range/ATR ratio at iloc[-2]
+    # explode, and the strategy's squeeze check covers bars through iloc[-2],
+    # so the prior window must still register as compressed.
+    breakout_close = base + 0.9   # just above tight-range Donchian upper
+    # iloc[-1]: confirm bar, HIGH volume — this is the bar whose volume the
+    # strategy reads via `rolling_volume_ratio().iloc[-1]`.
+    confirm_close = base + 1.0
 
     all_closes = tight_closes + [breakout_close, confirm_close]
-    all_highs  = tight_highs + [breakout_close + 0.5, confirm_close + 0.5]
-    all_lows   = tight_lows + [base + 4.0, base + 4.5]
+    all_highs  = tight_highs + [breakout_close + 0.05, confirm_close + 0.05]
+    all_lows   = tight_lows + [breakout_close - 0.05, confirm_close - 0.05]
     all_vols   = normal_vols + [1000.0, 4000.0]  # high volume on the last bar
 
     store = FeatureStore()
@@ -270,7 +302,10 @@ def test_volatility_breakout_emits_buy_on_squeeze_breakout() -> None:
     strategy = VolatilityBreakoutStrategy(
         timeframe="1h",
         donchian_period=20,
-        squeeze_atr_ratio_max=2.0,   # tight ranges with ATR≈0.4 and DC range≈0.6 → ratio≈1.5 < 2
+        # The strategy's squeeze window (`tail(squeeze_bars+1).iloc[:-1]`)
+        # includes iloc[-2] — the breakout bar itself — so the threshold
+        # must tolerate the small ratio expansion there.
+        squeeze_atr_ratio_max=2.5,
         squeeze_bars=3,
         volume_multiple=2.0,
         base_confidence=0.70,
@@ -395,21 +430,19 @@ def test_vwap_emits_buy_on_pullback_to_vwap_in_uptrend() -> None:
     - All prices are above VWAP initially, then the last two bars touch VWAP
       from above (long_touch condition).
 
-    VWAP resets at UTC midnight. We keep all bars in the same UTC day so the
-    cumulative VWAP is meaningful.
+    VWAP resets at UTC midnight. We keep all bars in the same UTC day (≤96
+    15m bars) so the cumulative VWAP is meaningful and is not re-seeded by
+    a day-boundary reset.
     """
-    # Use 100 bars in the same day (15m bars starting at 00:00 UTC)
-    n = 100
-    # Rising series: starts at 100, drifts up to ~120
-    closes = [100.0 + i * 0.2 for i in range(n)]
-    # Force VWAP pullback in last 2 bars:
-    # - prev bar close (index -2) should be well above VWAP
-    # - last bar close (index -1) should be at/near VWAP
-    # VWAP ≈ mean of typical prices up to that bar.
-    # Estimate VWAP by average close over first (n-2) bars
-    approx_vwap = sum(closes[:n-2]) / (n - 2)
-    closes[-2] = approx_vwap * 1.005   # prev: slightly above VWAP
-    closes[-1] = approx_vwap * 1.0003  # current: within band (0.1% = vwap_band_pct)
+    # 80 bars = 20 hours — fits comfortably inside a single UTC day
+    n = 80
+    # Steep rising trend so EMA(50) slope stays positive even after a single
+    # 1-bar pullback on the final bar. (EMA's alpha ≈ 2/51 ≈ 0.04, so one
+    # dip bar can only depress EMA slightly.)
+    closes = [100.0 + i * 0.4 for i in range(n)]
+    # Only the last bar pulls back onto VWAP. Bar -2 stays on the trend line.
+    approx_vwap = sum(closes[: n - 1]) / (n - 1)
+    closes[-1] = approx_vwap * 1.002    # lands just above VWAP (inside band)
 
     highs   = [c * 1.002 for c in closes]
     lows    = [c * 0.998 for c in closes]
@@ -436,7 +469,7 @@ def test_vwap_emits_buy_on_pullback_to_vwap_in_uptrend() -> None:
     strategy = VWAPStrategy(
         timeframe="15m",
         ema_period=50,
-        vwap_band_pct=0.005,   # 0.5% band — wider to ensure the touch is captured
+        vwap_band_pct=0.01,   # 1% band — wide enough to capture the touch
         base_confidence=0.60,
     )
 
