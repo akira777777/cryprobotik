@@ -234,6 +234,32 @@ class ExecutionConfig(BaseModel):
     slippage_tolerance_bps: float = Field(15.0, ge=0.0)
 
 
+class ExitConfig(BaseModel):
+    atr_period: int = Field(14, ge=2)
+    atr_trailing_mult: float = Field(1.5, gt=0.0)
+    breakeven_trigger_r: float = Field(1.0, gt=0.0)
+    partial_tp_trigger_r: float = Field(1.5, gt=0.0)
+    partial_tp_fraction: float = Field(0.5, gt=0.0, lt=1.0)
+    trailing_trigger_r: float = Field(2.0, gt=0.0)
+    max_bars_open: int = Field(48, ge=1)
+    time_exit_min_r: float = Field(0.5, ge=0.0)
+    check_interval_sec: float = Field(30.0, gt=0.0)
+
+    @model_validator(mode="after")
+    def _r_ordering(self) -> "ExitConfig":
+        if not (self.breakeven_trigger_r < self.partial_tp_trigger_r):
+            raise ValueError(
+                f"breakeven_trigger_r ({self.breakeven_trigger_r}) must be < "
+                f"partial_tp_trigger_r ({self.partial_tp_trigger_r})"
+            )
+        if not (self.partial_tp_trigger_r <= self.trailing_trigger_r):
+            raise ValueError(
+                f"partial_tp_trigger_r ({self.partial_tp_trigger_r}) must be <= "
+                f"trailing_trigger_r ({self.trailing_trigger_r})"
+            )
+        return self
+
+
 class PaperConfig(BaseModel):
     starting_balance_usd: float = Field(10000.0, gt=0.0)
     slippage_bps: float = Field(5.0, ge=0.0)
@@ -286,6 +312,7 @@ class AppConfig(BaseModel):
     regime: RegimeConfig = Field(default_factory=RegimeConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
+    exit: ExitConfig = Field(default_factory=ExitConfig)
     paper: PaperConfig = Field(default_factory=PaperConfig)
     notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
