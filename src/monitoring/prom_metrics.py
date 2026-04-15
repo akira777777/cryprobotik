@@ -126,3 +126,29 @@ telegram_send_failures_total = Counter(
     ["reason"],
     registry=REGISTRY,
 )
+
+# ─────────────────────── exit manager counters ───────────────────────
+exits_breakeven_total = Counter(
+    "cryprobotik_exits_breakeven_total",
+    "Times SL was moved to entry price (breakeven)",
+    ["exchange"],
+    registry=REGISTRY,
+)
+exits_trailed_total = Counter(
+    "cryprobotik_exits_trailed_total",
+    "Times trailing SL was updated after +2R",
+    ["exchange"],
+    registry=REGISTRY,
+)
+exits_partial_tp_total = Counter(
+    "cryprobotik_exits_partial_tp_total",
+    "Times 50% of a position was closed at +1.5R",
+    ["exchange"],
+    registry=REGISTRY,
+)
+exits_time_stop_total = Counter(
+    "cryprobotik_exits_time_stop_total",
+    "Times a position was closed by the time-based exit rule",
+    ["exchange"],
+    registry=REGISTRY,
+)

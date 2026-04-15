@@ -47,6 +47,7 @@ from src.exchanges.bybit import BybitConnector
 from src.exchanges.okx import OKXConnector
 from src.exchanges.paper import PaperConnector
 from src.execution.executor import OrderExecutor
+from src.execution.exit_manager import ExitConfig, ExitManager
 from src.execution.order_router import OrderRouter
 from src.monitoring import prom_metrics as m
 from src.monitoring.health import LiveBroadcaster, build_app, serve_health
@@ -110,6 +111,7 @@ class Orchestrator:
         self._cvd_store: CVDStore | None = None
         self._oi_store: OIStore | None = None
         self._funding_history: FundingHistory | None = None
+        self._exit_manager: "ExitManager | None" = None
 
     def _regime_snapshot(self) -> dict[str, str]:
         """Return {symbol: regime_name} for all symbols in the current universe.
@@ -217,6 +219,13 @@ class Orchestrator:
             storage=self._storage,
             config=self._settings.config.execution,
             mode=self._mode,
+        )
+
+        # Exit manager — dynamic SL/TP management (breakeven, trailing, partial TP)
+        self._exit_manager = ExitManager(
+            tracker=self._tracker,
+            feature_store=self._feature_store,
+            connectors=self._connectors,
         )
 
         # Strategies + ensemble
@@ -502,6 +511,10 @@ class Orchestrator:
                 if self._oi_store is not None:
                     for name, conn in self._connectors.items():
                         tg.create_task(self._oi_poll_loop(name, conn), name=f"oi_poll.{name}")
+
+                # Exit manager — trailing stops, breakeven, partial TP, time-exit
+                if self._exit_manager is not None:
+                    tg.create_task(self._exit_manager.run(), name="exit_manager")
 
                 # Portfolio reconcile
                 tg.create_task(self._tracker.run_reconcile_loop(), name="reconcile")
@@ -985,6 +998,17 @@ class Orchestrator:
 
         # Execute
         result = await self._executor.execute(sized, signal_id=signal_id)
+        if result is not None and self._exit_manager is not None:
+            # Register with the exit manager so it can apply trailing/breakeven/TP rules.
+            risk_usd = sized.risk_usd
+            self._exit_manager.register_position(
+                exchange=exchange,
+                symbol=symbol,
+                entry_ts=ts,
+                original_sl=sized.stop_loss,
+                risk_usd=risk_usd,
+                sl_order_id=result.exchange_order_id,  # may be updated by arm_exits
+            )
         if result is not None and self._telegram is not None:
             self._telegram.push_signal_event(
                 symbol=symbol, side=signal.side.value,

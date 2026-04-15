@@ -77,10 +77,12 @@ class OrderRouter:
         def exposure_score(ex_name: str) -> float:
             return self._tracker.exposure_by_exchange().get(ex_name, 0.0)
 
-        # Composite rank: funding edge first, exposure as tiebreaker
+        # Composite rank: funding edge first (higher = better), exposure as
+        # tiebreaker (lower = better, so negate so it sorts correctly with
+        # reverse=True — i.e. the venue with less exposure scores "higher").
         ranked = sorted(
             candidates,
-            key=lambda kv: (funding_score(kv[0]), exposure_score(kv[0])),
+            key=lambda kv: (funding_score(kv[0]), -exposure_score(kv[0])),
             reverse=True,
         )
         best_name, best_conn = ranked[0]

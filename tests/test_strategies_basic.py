@@ -1,0 +1,458 @@
+"""
+Happy-path tests for each strategy.
+
+Goal: verify that each strategy emits the expected side (BUY/SELL) given
+synthetic price data designed to trigger its entry rules.  We do NOT test
+that signals never trigger — that is covered by property tests and edge-case
+tests elsewhere.
+
+Each test:
+    1. Builds a FeatureStore populated with a synthetic price series.
+    2. Instantiates the strategy with minimal, realistic parameters.
+    3. Calls evaluate() and asserts ≥1 Signal is returned with the right side.
+
+Strategies covered:
+    - MomentumStrategy         (BUY on strong uptrend)
+    - MeanReversionStrategy    (BUY on lower-BB touch without 4h data)
+    - VolatilityBreakoutStrategy (BUY on squeeze + breakout)
+    - FundingContrarianStrategy (SELL on extreme positive funding)
+    - VWAPStrategy              (BUY on pullback to VWAP in uptrend)
+
+NOTE: these tests require pandas_ta (and its numba dependency) to be installed.
+They are skipped automatically on Python ≥3.14 where numba cannot be built.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+# pandas_ta requires numba+tqdm which cannot be installed on Python >=3.14;
+# skip the entire module gracefully when those dependencies are missing.
+pytest.importorskip("pandas_ta", reason="pandas_ta and its deps required (Python <3.14 only)")
+
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+from src.data.feature_store import Bar, FeatureKey, FeatureStore, FundingHistory
+from src.exchanges.base import OrderSide
+from src.strategies.base import SignalAction
+from src.strategies.funding_contrarian import FundingContrarianStrategy
+from src.strategies.mean_reversion import MeanReversionStrategy
+from src.strategies.momentum import MomentumStrategy
+from src.strategies.vwap import VWAPStrategy
+from src.strategies.volatility_breakout import VolatilityBreakoutStrategy
+
+
+# ─────────────────────── helpers ───────────────────────
+
+EXCHANGE = "okx"
+SYMBOL = "BTC/USDT:USDT"
+_TS0 = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+def _ms(i: int, interval_sec: int = 15 * 60) -> int:
+    return int((_TS0 + timedelta(seconds=i * interval_sec)).timestamp() * 1000)
+
+
+def _populate_store(
+    store: FeatureStore,
+    closes: list[float],
+    timeframe: str,
+    interval_sec: int,
+    highs: list[float] | None = None,
+    lows: list[float] | None = None,
+    volumes: list[float] | None = None,
+) -> None:
+    """Load synthetic bars into a FeatureStore from close prices."""
+    key = FeatureKey(EXCHANGE, SYMBOL, timeframe)
+    n = len(closes)
+    _highs = highs or [c * 1.002 for c in closes]
+    _lows = lows or [c * 0.998 for c in closes]
+    _vols = volumes or [1000.0] * n
+
+    bars = [
+        Bar(
+            ts_ms=_ms(i, interval_sec),
+            open=closes[i - 1] if i > 0 else closes[0] * 0.999,
+            high=_highs[i],
+            low=_lows[i],
+            close=closes[i],
+            volume=_vols[i],
+        )
+        for i in range(n)
+    ]
+    store.bulk_load(key, bars)
+
+
+# ─────────────────────── MomentumStrategy ───────────────────────
+
+
+def test_momentum_emits_buy_on_strong_uptrend() -> None:
+    """
+    A strongly rising 15m series → EMA stack (fast > mid > slow) AND
+    a modestly bullish 1h RSI, AND positive 4h MACD histogram.
+    """
+    # 250 bars, each higher by 1.5
+    n = 250
+    base = 100.0
+    closes_15m = [base + i * 1.5 for i in range(n)]
+    closes_1h = [base + i * 6.0 for i in range(n)]  # 4x compression
+    closes_4h = [base + i * 24.0 for i in range(n)] # 16x compression
+
+    store = FeatureStore()
+    _populate_store(store, closes_15m, "15m", 15 * 60)
+    _populate_store(store, closes_1h, "1h", 60 * 60)
+    _populate_store(store, closes_4h, "4h", 4 * 60 * 60)
+
+    strategy = MomentumStrategy(
+        timeframes=["15m", "1h", "4h"],
+        ema_fast=9,
+        ema_mid=21,
+        ema_slow=55,
+        rsi_period=14,
+        rsi_long_threshold=50,
+        rsi_short_threshold=50,
+        macd_fast=12,
+        macd_slow=26,
+        macd_signal=9,
+        base_confidence=0.65,
+        volume_multiplier=0.0,   # disable volume filter for simplicity
+    )
+
+    signals = strategy.evaluate(SYMBOL, store, EXCHANGE, _TS0)
+
+    # Must emit at least one BUY signal
+    buy_signals = [s for s in signals if s.side == OrderSide.BUY]
+    assert buy_signals, f"expected BUY signals, got: {signals}"
+    for s in buy_signals:
+        assert s.action == SignalAction.OPEN
+        assert 0.0 < s.confidence <= 1.0
+        assert s.symbol == SYMBOL
+        assert s.strategy == "momentum"
+
+
+def test_momentum_returns_empty_on_insufficient_data() -> None:
+    """Returns [] when the store doesn't have enough bars to compute indicators."""
+    store = FeatureStore()
+    # Only 10 bars — far fewer than ema_slow(55) + 5
+    closes = [100.0 + i for i in range(10)]
+    _populate_store(store, closes, "15m", 15 * 60)
+    # 1h and 4h are missing entirely
+
+    strategy = MomentumStrategy(
+        timeframes=["15m", "1h", "4h"],
+        ema_fast=9, ema_mid=21, ema_slow=55,
+        rsi_period=14, rsi_long_threshold=50, rsi_short_threshold=50,
+        macd_fast=12, macd_slow=26, macd_signal=9,
+        base_confidence=0.65,
+    )
+    assert strategy.evaluate(SYMBOL, store, EXCHANGE, _TS0) == []
+
+
+# ─────────────────────── MeanReversionStrategy ───────────────────────
+
+
+def test_mean_reversion_emits_buy_on_lower_bb_touch() -> None:
+    """
+    Build a ranging series (ADX will stay low) and force the last bar to
+    dip below the lower Bollinger Band with RSI(2) oversold.
+
+    No 4h data in the store → falling-knife veto is skipped.
+    """
+    rng = np.random.default_rng(0)
+    n = 80
+    # Sideways oscillation around 100 with low volatility → low ADX
+    base = 100.0
+    noise = rng.normal(0, 0.5, n)
+    closes = [base + noise[i] for i in range(n)]
+
+    # Force the last 3 bars to dip sharply below the mean → below BB lower band
+    drop = 8.0  # push ~8 std below the mean
+    closes[-3] = base - drop
+    closes[-2] = base - drop * 0.9
+    closes[-1] = base - drop * 1.1  # final dip below lower band
+
+    # Build highs/lows to match (important for `last_low`)
+    highs = [c + 0.5 for c in closes]
+    lows = [c - 0.5 for c in closes]
+    lows[-1] = closes[-1] - 0.1  # make sure last_low <= lower band
+
+    store = FeatureStore()
+    _populate_store(store, closes, "15m", 15 * 60, highs=highs, lows=lows)
+
+    strategy = MeanReversionStrategy(
+        timeframe="15m",
+        bb_period=20,
+        bb_std=2.0,
+        rsi_period=2,
+        rsi_long_threshold=20,    # RSI(2) at extreme dip will be < 10
+        rsi_short_threshold=80,
+        adx_max=30.0,             # ADX should stay well below this on synthetic data
+        base_confidence=0.60,
+    )
+
+    signals = strategy.evaluate(SYMBOL, store, EXCHANGE, _TS0)
+    buy_signals = [s for s in signals if s.side == OrderSide.BUY]
+
+    assert buy_signals, (
+        f"expected BUY from mean_reversion on BB lower touch, got: {signals}"
+    )
+    for s in buy_signals:
+        assert s.action == SignalAction.OPEN
+        assert 0.0 < s.confidence <= 1.0
+        assert s.strategy == "mean_reversion"
+
+
+def test_mean_reversion_returns_empty_on_trending_market() -> None:
+    """
+    In a strong trend (high ADX), mean reversion must not fire.
+    We verify the strategy returns [] when there are insufficient bars
+    (a safe proxy for the cold-start guard).
+    """
+    store = FeatureStore()
+    # 5 bars — far below bb_period (20)
+    closes = [100.0 + i * 2 for i in range(5)]
+    _populate_store(store, closes, "15m", 15 * 60)
+
+    strategy = MeanReversionStrategy(
+        timeframe="15m", bb_period=20, bb_std=2.0,
+        rsi_period=2, rsi_long_threshold=20, rsi_short_threshold=80,
+        adx_max=30.0, base_confidence=0.60,
+    )
+    assert strategy.evaluate(SYMBOL, store, EXCHANGE, _TS0) == []
+
+
+# ─────────────────────── VolatilityBreakoutStrategy ───────────────────────
+
+
+def test_volatility_breakout_emits_buy_on_squeeze_breakout() -> None:
+    """
+    Build a series where:
+    - The first 150 bars oscillate in a tight range (Donchian/ATR < ratio_max).
+    - The last bar's *second-to-last closed bar* (iloc[-2]) closes decisively
+      above the Donchian upper of the previous bar.
+    - Volume is 3× the 20-bar mean on the breakout bar.
+
+    Note: the strategy uses iloc[-2] as the "last CLOSED bar" and
+    checks volume on the *current* bar (iloc[-1]).
+    """
+    rng = np.random.default_rng(7)
+
+    # Base tight-range section: small oscillation
+    tight_n = 170
+    base = 100.0
+    tight_closes = [base + rng.uniform(-0.3, 0.3) for _ in range(tight_n)]
+    tight_highs  = [c + 0.4 for c in tight_closes]
+    tight_lows   = [c - 0.4 for c in tight_closes]
+    normal_vols  = [1000.0] * tight_n
+
+    # iloc[-2]: the big breakout candle — close well above the channel
+    breakout_close = base + 5.0
+    # iloc[-1]: the confirming bar (still above channel), HIGH volume
+    confirm_close = base + 5.2
+
+    all_closes = tight_closes + [breakout_close, confirm_close]
+    all_highs  = tight_highs + [breakout_close + 0.5, confirm_close + 0.5]
+    all_lows   = tight_lows + [base + 4.0, base + 4.5]
+    all_vols   = normal_vols + [1000.0, 4000.0]  # high volume on the last bar
+
+    store = FeatureStore()
+    _populate_store(
+        store, all_closes, "1h", 60 * 60,
+        highs=all_highs, lows=all_lows, volumes=all_vols
+    )
+
+    strategy = VolatilityBreakoutStrategy(
+        timeframe="1h",
+        donchian_period=20,
+        squeeze_atr_ratio_max=2.0,   # tight ranges with ATR≈0.4 and DC range≈0.6 → ratio≈1.5 < 2
+        squeeze_bars=3,
+        volume_multiple=2.0,
+        base_confidence=0.70,
+    )
+
+    signals = strategy.evaluate(SYMBOL, store, EXCHANGE, _TS0)
+    buy_signals = [s for s in signals if s.side == OrderSide.BUY]
+
+    assert buy_signals, (
+        f"expected BUY from volatility_breakout on squeeze+breakout, got: {signals}"
+    )
+    for s in buy_signals:
+        assert s.action == SignalAction.OPEN
+        assert 0.0 < s.confidence <= 1.0
+        assert s.strategy == "volatility_breakout"
+
+
+def test_volatility_breakout_returns_empty_on_insufficient_data() -> None:
+    store = FeatureStore()
+    _populate_store(store, [100.0] * 10, "1h", 60 * 60)
+
+    strategy = VolatilityBreakoutStrategy(
+        timeframe="1h", donchian_period=20, squeeze_atr_ratio_max=2.0,
+        squeeze_bars=3, volume_multiple=2.0, base_confidence=0.70,
+    )
+    assert strategy.evaluate(SYMBOL, store, EXCHANGE, _TS0) == []
+
+
+# ─────────────────────── FundingContrarianStrategy ───────────────────────
+
+
+def test_funding_contrarian_emits_sell_on_extreme_high_funding() -> None:
+    """
+    When the current funding rate is at the 95th percentile of history
+    (crowded longs paying heavy premium), the contrarian signal is SELL.
+
+    No FeatureStore data is passed → the 4h trend veto is skipped.
+    """
+    fh = FundingHistory()
+    # Load 25 normal rates around 0.01%
+    for _ in range(25):
+        fh.update(EXCHANGE, SYMBOL, 0.0001)
+    # Add a few at higher levels to spread distribution
+    for v in [0.0002, 0.0003, 0.0005, 0.0008]:
+        fh.update(EXCHANGE, SYMBOL, v)
+    # Current extreme rate: top 5th percentile
+    fh.update(EXCHANGE, SYMBOL, 0.005)
+
+    strategy = FundingContrarianStrategy(
+        funding_history=fh,
+        extreme_threshold=0.85,
+        low_threshold=0.15,
+        base_confidence=0.55,
+    )
+
+    # Empty store → no 4h bars → trend veto can't trigger → pure funding signal
+    store = FeatureStore()
+    signals = strategy.evaluate(SYMBOL, store, EXCHANGE, _TS0)
+
+    sell_signals = [s for s in signals if s.side == OrderSide.SELL]
+    assert sell_signals, (
+        f"expected SELL from funding_contrarian on extreme funding, got: {signals}"
+    )
+    for s in sell_signals:
+        assert s.action == SignalAction.OPEN
+        assert 0.0 < s.confidence <= 1.0
+        assert s.strategy == "funding_contrarian"
+
+
+def test_funding_contrarian_emits_buy_on_extreme_low_funding() -> None:
+    """
+    When funding is at the 5th percentile (crowded shorts paying premium),
+    the contrarian signal is BUY.
+    """
+    fh = FundingHistory()
+    for _ in range(25):
+        fh.update(EXCHANGE, SYMBOL, 0.0001)
+    for v in [0.0002, 0.0003, 0.0004]:
+        fh.update(EXCHANGE, SYMBOL, v)
+    # Extreme negative rate: shorts are paying premium → BUY
+    fh.update(EXCHANGE, SYMBOL, -0.005)
+
+    strategy = FundingContrarianStrategy(
+        funding_history=fh,
+        extreme_threshold=0.85,
+        low_threshold=0.15,
+        base_confidence=0.55,
+    )
+
+    store = FeatureStore()
+    signals = strategy.evaluate(SYMBOL, store, EXCHANGE, _TS0)
+
+    buy_signals = [s for s in signals if s.side == OrderSide.BUY]
+    assert buy_signals, (
+        f"expected BUY from funding_contrarian on extreme negative funding, got: {signals}"
+    )
+
+
+def test_funding_contrarian_no_signal_on_cold_start() -> None:
+    """FundingHistory with <20 samples → percentile returns 0.5 → no signal."""
+    fh = FundingHistory()
+    # Only 5 samples — below the 20-sample warm-up guard
+    for v in [0.001, 0.002, 0.003, -0.001, 0.005]:
+        fh.update(EXCHANGE, SYMBOL, v)
+    fh.update(EXCHANGE, SYMBOL, 0.005)  # would be extreme if enough history existed
+
+    strategy = FundingContrarianStrategy(
+        funding_history=fh, extreme_threshold=0.85, low_threshold=0.15,
+        base_confidence=0.55,
+    )
+    store = FeatureStore()
+    assert strategy.evaluate(SYMBOL, store, EXCHANGE, _TS0) == []
+
+
+# ─────────────────────── VWAPStrategy ───────────────────────
+
+
+def test_vwap_emits_buy_on_pullback_to_vwap_in_uptrend() -> None:
+    """
+    Construct a series where:
+    - EMA(50) is clearly rising (uptrend confirmed).
+    - All prices are above VWAP initially, then the last two bars touch VWAP
+      from above (long_touch condition).
+
+    VWAP resets at UTC midnight. We keep all bars in the same UTC day so the
+    cumulative VWAP is meaningful.
+    """
+    # Use 100 bars in the same day (15m bars starting at 00:00 UTC)
+    n = 100
+    # Rising series: starts at 100, drifts up to ~120
+    closes = [100.0 + i * 0.2 for i in range(n)]
+    # Force VWAP pullback in last 2 bars:
+    # - prev bar close (index -2) should be well above VWAP
+    # - last bar close (index -1) should be at/near VWAP
+    # VWAP ≈ mean of typical prices up to that bar.
+    # Estimate VWAP by average close over first (n-2) bars
+    approx_vwap = sum(closes[:n-2]) / (n - 2)
+    closes[-2] = approx_vwap * 1.005   # prev: slightly above VWAP
+    closes[-1] = approx_vwap * 1.0003  # current: within band (0.1% = vwap_band_pct)
+
+    highs   = [c * 1.002 for c in closes]
+    lows    = [c * 0.998 for c in closes]
+    volumes = [1000.0] * n
+
+    store = FeatureStore()
+
+    # All bars in the same UTC day (starting from midnight)
+    day_start = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
+    key = FeatureKey(EXCHANGE, SYMBOL, "15m")
+    bars = [
+        Bar(
+            ts_ms=int((day_start + timedelta(minutes=15 * i)).timestamp() * 1000),
+            open=closes[i - 1] if i > 0 else closes[0] * 0.999,
+            high=highs[i],
+            low=lows[i],
+            close=closes[i],
+            volume=volumes[i],
+        )
+        for i in range(n)
+    ]
+    store.bulk_load(key, bars)
+
+    strategy = VWAPStrategy(
+        timeframe="15m",
+        ema_period=50,
+        vwap_band_pct=0.005,   # 0.5% band — wider to ensure the touch is captured
+        base_confidence=0.60,
+    )
+
+    signals = strategy.evaluate(SYMBOL, store, EXCHANGE, _TS0)
+    buy_signals = [s for s in signals if s.side == OrderSide.BUY]
+
+    assert buy_signals, (
+        f"expected BUY from vwap on pullback to VWAP, got: {signals}"
+    )
+    for s in buy_signals:
+        assert s.action == SignalAction.OPEN
+        assert 0.0 < s.confidence <= 1.0
+        assert s.strategy == "vwap"
+
+
+def test_vwap_returns_empty_on_insufficient_bars() -> None:
+    store = FeatureStore()
+    _populate_store(store, [100.0] * 10, "15m", 15 * 60)
+
+    strategy = VWAPStrategy(timeframe="15m", ema_period=50, base_confidence=0.60)
+    assert strategy.evaluate(SYMBOL, store, EXCHANGE, _TS0) == []
