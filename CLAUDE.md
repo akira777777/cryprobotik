@@ -25,8 +25,10 @@ python -m src.data.storage --apply-schema
 # Start bot (paper mode — safe default, no real orders)
 python -m src.main --mode paper
 
-# Start bot with local Python 3.13 venv (when Docker unavailable)
+# Start bot with local Python venv (when Docker unavailable)
 .venv313/Scripts/python.exe -m src.main --mode paper
+# Or with system Python 3.14 (Windows)
+C:/Python314/python.exe -m src.main --mode paper
 
 # Start bot + localtunnel together (sets MINIAPP_URL automatically)
 bash start_bot.sh paper
@@ -100,6 +102,8 @@ Only closed bars trigger evaluation — forming bars update the store but are no
 | `VolatilityBreakoutStrategy` | `volatility_breakout.py` | Donchian squeeze + volume surge on 1h |
 | `FundingArbStrategy` | `funding_arb.py` | Cross-exchange funding rate delta > `min_rate_delta`; emits `PairSignal` |
 | `FundingContrarianStrategy` | `funding_contrarian.py` | Funding rate in top/bottom `extreme_threshold` percentile of rolling history → contrarian trade |
+| `VWAPStrategy` | `vwap.py` | Price deviation from VWAP > `vwap_band_pct` with EMA trend confirmation on 15m |
+| `LiquidationCascadeStrategy` | `liquidation_cascade.py` | OI ROC < `oi_roc_threshold` (−3%) + price move > 1.5×ATR → counter-trend bounce signal |
 
 `FundingContrarianStrategy` requires a `FundingHistory` instance (injected at construction from `Orchestrator._funding_history`). It needs ≥20 historical samples before emitting any signal (cold-start guard). When funding is in the top 15% of its historical distribution, longs are paying excessive premium → emits SELL. Bottom 15% → emits BUY. **Hardening**: effective threshold is tightened to ~10th/90th percentile internally (`extreme_threshold * 0.67`). **Trend veto**: if 4h EMA21 is well below EMA55 (strong downtrend), SELL signals are vetoed; if EMA21 is well above EMA55 (strong uptrend), BUY signals are vetoed.
 
@@ -117,12 +121,29 @@ Three stores are instantiated in `Orchestrator.setup()` alongside `FeatureStore`
 - **`OIStore`** — rolling open-interest history. `update(exchange, symbol, oi_contracts)` appends snapshots; `oi_roc(exchange, symbol, periods=5)` returns the rate of change as a fraction.
 - **`FundingHistory`** — rolling funding rate distribution. `update(exchange, symbol, rate)` feeds history; `percentile(exchange, symbol, rate)` returns `[0,1]` rank. Used by `FundingContrarianStrategy`.
 
+### Exit manager (`src/execution/exit_manager.py`)
+
+Runs as a background async task in the Orchestrator alongside `_oi_poll_loop`. Monitors all open positions and applies four dynamic exit rules in priority order:
+
+1. **Breakeven** — once unrealized gain ≥ `breakeven_trigger_r` × R, moves SL to entry price
+2. **Partial TP** — once gain ≥ `partial_tp_trigger_r` × R, closes `partial_tp_fraction` of the position (reduce-only market)
+3. **Trailing SL** — once gain ≥ `trailing_trigger_r` × R, trails SL at `current_price ± atr_trailing_mult × ATR(14)`
+4. **Time exit** — if position has been open ≥ `max_bars_open` 15m bars without reaching `time_exit_min_r × R`, closes the entire position
+
+Key design points:
+
+- `register_position(exchange, symbol, entry_ts, original_sl, risk_usd, sl_order_id, tp_order_id)` must be called by the executor immediately after a fill to seed the `_ExitState` record.
+- `on_bar_close(exchange, symbol, timeframe)` increments the `bars_open` counter — **only for `timeframe == "15m"`**. Called from `kline_pump` on every closed bar. Do NOT call this anywhere else; the counter was previously buggy because it incremented on every polling tick instead.
+- `adjust_stop()` uses "place new first, cancel old" discipline: if the new SL order is rejected, the old one is **not** cancelled.
+- All parameters are in `ExitConfig` (pydantic, `src/settings.py`) under the `exit:` section of `config/config.yaml`. The validator enforces `breakeven_trigger_r < partial_tp_trigger_r ≤ trailing_trigger_r`.
+- Prometheus: `exits_breakeven_total`, `exits_trailed_total`, `exits_partial_tp_total`, `exits_time_stop_total` (all labelled `exchange`).
+
 ### Risk layer (`src/risk/`)
 
 Three components with distinct responsibilities:
 - `RiskManager` — **stateless**. ATR-based sizing: `qty = (equity × risk_per_trade_pct) / (SL_distance × contract_size)`. Computes SL/TP, enforces leverage and min-notional.
 - `PortfolioLimits` — **stateful**. Enforces max open positions, per-symbol cap, correlation cap (1h close returns), and margin utilization. Correlation matrix is recomputed from `FeatureStore` data at check time.
-- `KillSwitch` — persisted to `bot_state` DB table. Trips when daily drawdown exceeds `max_daily_drawdown_pct`. Requires a manual DB row delete to reset.
+- `KillSwitch` — persisted to `bot_state` DB table. Trips when daily drawdown exceeds `max_daily_drawdown_pct`. To reset: `DELETE FROM bot_state WHERE key = 'kill_switch.state'` (also clear `positions_snapshot` if stale positions remain).
 
 Hard ceilings (leverage ≤ 10, risk_per_trade ≤ 5%, etc.) are enforced at startup in `src/settings.py` — exceeding them causes a validation error before the bot touches any exchange.
 

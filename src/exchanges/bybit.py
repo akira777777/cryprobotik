@@ -115,6 +115,11 @@ class BybitConnector(ExchangeConnector):
             },
         }
         self._rest: ccxt_async.bybit = ccxt_async.bybit(ccxt_opts)
+        # Skip the authenticated fetch_currencies call in load_markets: futures
+        # trading only needs public instrument metadata, and requiring an
+        # Assets:Read permission on every API key is unnecessary friction
+        # (especially in paper mode where only market data is consumed).
+        self._rest.has["fetchCurrencies"] = False
         if mode == RuntimeMode.TESTNET:
             self._rest.set_sandbox_mode(True)
 
