@@ -73,9 +73,16 @@ class FundingContrarianStrategy(Strategy):
 
         pct = self._history.percentile(exchange, symbol, rate)
 
-        # Tighter thresholds: use 0.67 multiplier to narrow to ~10th/90th percentile.
-        tight_high = 1.0 - self._extreme_threshold * 0.67  # e.g. 0.15*0.67=0.10 → 0.90
-        tight_low = self._extreme_threshold * 0.67          # e.g. 0.15*0.67=0.10
+        # Tighter thresholds: narrow the extreme zones by ~33% so the strategy
+        # only fires at the real tail of the distribution (~10th/90th
+        # percentile for default extreme_threshold=0.85 / low_threshold=0.15).
+        #   extreme_gap      = 1 - extreme_threshold   (size of upper tail)
+        #   tight_high       = 1 - extreme_gap * 0.67  (e.g. 0.85 → 0.90)
+        #   low_gap          = low_threshold           (size of lower tail)
+        #   tight_low        = low_gap * 0.67          (e.g. 0.15 → 0.10)
+        extreme_gap = max(0.0, 1.0 - self._extreme_thr)
+        tight_high = 1.0 - extreme_gap * 0.67
+        tight_low = self._low_thr * 0.67
 
         if pct >= tight_high:
             # Longs are paying an excessive funding premium → crowded long → SHORT
