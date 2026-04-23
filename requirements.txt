@@ -9,7 +9,7 @@ ccxt>=4.4.30                    # async REST client for OKX + Bybit (v5 APIs)
 websockets==13.1                # native WS client (we implement v5 protocols ourselves)
 
 # --- Async infra ---
-aiohttp==3.10.10                # required transitively by ccxt async
+aiohttp==3.13.4                # required transitively by ccxt async
 uvloop==0.21.0 ; sys_platform != "win32"   # drop-in faster event loop on Linux/macOS
 tenacity==9.0.0                 # exponential-backoff retry decorator for REST calls
 
@@ -39,7 +39,7 @@ uvicorn[standard]==0.32.0
 python-telegram-bot[rate-limiter]==21.6
 
 # --- Dev & testing ---
-pytest==8.3.3
+pytest==9.0.3
 pytest-asyncio==0.24.0
 pytest-mock==3.14.0
 ruff==0.7.1
