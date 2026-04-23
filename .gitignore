@@ -29,7 +29,7 @@ pnpm-lock.yaml
 
 # Runtime artifacts
 logs/
-data/
+/data/
 *.sqlite
 *.db
 *.db-journal
